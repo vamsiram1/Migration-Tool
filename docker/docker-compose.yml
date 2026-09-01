@@ -1,0 +1,42 @@
+services:
+
+  mysql:
+    image: mysql:8.4
+    container_name: migration-mysql
+    restart: unless-stopped
+
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: legacydb
+      MYSQL_USER: migrator
+      MYSQL_PASSWORD: migrator
+
+    ports:
+      - "3306:3306"
+
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  postgres:
+    image: postgres:17
+
+    container_name: migration-postgres
+
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: newdb
+      POSTGRES_USER: migrator
+      POSTGRES_PASSWORD: migrator
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+
+  mysql_data:
+
+  postgres_data:

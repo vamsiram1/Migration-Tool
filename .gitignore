@@ -1,0 +1,9 @@
+.venv/
+backend/__pycache__/
+backend/app/**/__pycache__/
+frontend/node_modules/
+frontend/dist/
+pgloader-data/
+*.load
+mysql-to-pgloader.ps1
+*-project.json
