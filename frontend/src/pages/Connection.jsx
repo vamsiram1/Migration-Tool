@@ -15,6 +15,9 @@ import {
   Tabs,
   Tab,
   Box,
+  Switch,
+  FormControlLabel,
+  Chip,
 } from "@mui/material";
 
 import DatabaseCard from "../components/DatabaseCard";
@@ -22,7 +25,8 @@ import TableList from "../components/TableList";
 import ColumnMapping from "../components/ColumnMapping";
 import IdRemappingTool from "../components/IdRemappingTool";
 import { generatePgloaderConfig } from "../services/pgloader";
-import { runDockerMigration } from "../services/dockerRun";
+import { runDockerMigration, cancelDockerMigration } from "../services/dockerRun";
+
 
 import {
   testMysql,
@@ -97,7 +101,9 @@ export default function Connection() {
   const [projectSaving, setProjectSaving] = useState(false);
   const [dockerOutput, setDockerOutput] = useState("");
   const [dockerRunning, setDockerRunning] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [activeTab, setActiveTab] = useState(0);
+  const [limitRecords, setLimitRecords] = useState(false);
   const projectFileInput = useRef(null);
 
   const pgloaderFiles = generatePgloaderConfig({
@@ -106,6 +112,7 @@ export default function Connection() {
     tableMappings,
     columnMappings,
     selectedSchemas,
+    limitRows: limitRecords ? 1000 : null,
   });
 
   // -------------------------------
@@ -119,7 +126,7 @@ export default function Connection() {
 
       const mysqlResponse = await mysqlTables({ ...mysqlConnection, schema_name: selectedSchemas.mysql });
       const postgresResponse = await postgresTables({ ...postgresConnection, schema_name: selectedSchemas.postgres });
-        
+
       setMigration({
         mysqlTables: mysqlResponse.data,
         postgresTables: postgresResponse.data,
@@ -275,14 +282,14 @@ export default function Connection() {
   };
 
   const currentProject = () => ({
-      version: 1,
-      mysqlConnection,
-      postgresConnection,
-      selectedSchemas,
-      migration,
-      tableMappings,
-      columnMappings,
-    });
+    version: 1,
+    mysqlConnection,
+    postgresConnection,
+    selectedSchemas,
+    migration,
+    tableMappings,
+    columnMappings,
+  });
 
   const saveProject = () => {
     const project = currentProject();
@@ -443,6 +450,21 @@ export default function Connection() {
       setError("Unable to run the Docker migration.");
     } finally {
       setDockerRunning(false);
+      setCancelling(false);
+    }
+  };
+
+  const cancelMigration = async () => {
+    try {
+      setCancelling(true);
+      setDockerOutput((prev) => `${prev}\nCancelling migration and stopping containers...\n`);
+      const response = await cancelDockerMigration();
+      setDockerOutput((prev) => `${prev}${response.data?.message || "Migration cancelled."}\n`);
+    } catch (err) {
+      const detail = err.response?.data?.detail || err.message || "Failed to cancel migration";
+      setError(String(detail));
+    } finally {
+      setCancelling(false);
     }
   };
 
@@ -604,179 +626,223 @@ export default function Connection() {
       {activeTab === 0 && (
         <>
           {schemas.mysql.length > 0 && postgresDatabaseOptions.length > 0 && (
-        <Grid container spacing={3} sx={{ mt: 1 }}>
-          <Grid size={{ xs: 12, md: 6 }}>
-            <FormControl fullWidth>
-              <InputLabel id="mysql-schema-label">MySQL schema</InputLabel>
-              <Select
-                labelId="mysql-schema-label"
-                label="MySQL schema"
-                value={selectedSchemas.mysql}
-                onChange={(event) => setSelectedSchemas((previous) => ({ ...previous, mysql: event.target.value }))}
-              >
-                {schemas.mysql.map((schema) => (
-                  <MenuItem key={schema.schema_name} value={schema.schema_name}>{schema.schema_name}</MenuItem>
-                ))}
-              </Select>
-            </FormControl>
-          </Grid>
+            <Grid container spacing={3} sx={{ mt: 1 }}>
+              <Grid size={{ xs: 12, md: 6 }}>
+                <FormControl fullWidth>
+                  <InputLabel id="mysql-schema-label">MySQL schema</InputLabel>
+                  <Select
+                    labelId="mysql-schema-label"
+                    label="MySQL schema"
+                    value={selectedSchemas.mysql}
+                    onChange={(event) => setSelectedSchemas((previous) => ({ ...previous, mysql: event.target.value }))}
+                  >
+                    {schemas.mysql.map((schema) => (
+                      <MenuItem key={schema.schema_name} value={schema.schema_name}>{schema.schema_name}</MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              </Grid>
 
-          <Grid size={{ xs: 12, md: 6 }}>
-            <FormControl fullWidth>
-              <InputLabel id="postgres-database-label">PostgreSQL database</InputLabel>
-              <Select
-                labelId="postgres-database-label"
-                label="PostgreSQL database"
-                value={postgresConnection.database}
-                onChange={(event) => selectPostgresDatabase(event.target.value)}
-              >
-                {postgresDatabaseOptions.map((database) => (
-                  <MenuItem key={database.database_name} value={database.database_name}>{database.database_name}</MenuItem>
-                ))}
-              </Select>
-            </FormControl>
-          </Grid>
+              <Grid size={{ xs: 12, md: 6 }}>
+                <FormControl fullWidth>
+                  <InputLabel id="postgres-database-label">PostgreSQL database</InputLabel>
+                  <Select
+                    labelId="postgres-database-label"
+                    label="PostgreSQL database"
+                    value={postgresConnection.database}
+                    onChange={(event) => selectPostgresDatabase(event.target.value)}
+                  >
+                    {postgresDatabaseOptions.map((database) => (
+                      <MenuItem key={database.database_name} value={database.database_name}>{database.database_name}</MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              </Grid>
 
-          {schemas.postgres.length > 0 && (
-            <Grid size={{ xs: 12, md: 6 }}>
-              <FormControl fullWidth>
-                <InputLabel id="postgres-schema-label">PostgreSQL schema</InputLabel>
-                <Select
-                  labelId="postgres-schema-label"
-                  label="PostgreSQL schema"
-                  value={selectedSchemas.postgres}
-                  onChange={(event) => setSelectedSchemas((previous) => ({ ...previous, postgres: event.target.value }))}
-                >
-                  {schemas.postgres.map((schema) => (
-                    <MenuItem key={schema.schema_name} value={schema.schema_name}>{schema.schema_name}</MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
+              {schemas.postgres.length > 0 && (
+                <Grid size={{ xs: 12, md: 6 }}>
+                  <FormControl fullWidth>
+                    <InputLabel id="postgres-schema-label">PostgreSQL schema</InputLabel>
+                    <Select
+                      labelId="postgres-schema-label"
+                      label="PostgreSQL schema"
+                      value={selectedSchemas.postgres}
+                      onChange={(event) => setSelectedSchemas((previous) => ({ ...previous, postgres: event.target.value }))}
+                    >
+                      {schemas.postgres.map((schema) => (
+                        <MenuItem key={schema.schema_name} value={schema.schema_name}>{schema.schema_name}</MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                </Grid>
+              )}
             </Grid>
           )}
-        </Grid>
-      )}
 
-      <Button
-        sx={{ mt: 3 }}
-        variant="contained"
-        size="large"
-        onClick={loadTables}
-        disabled={loading || !selectedSchemas.mysql || !selectedSchemas.postgres}
-      >
-        {loading ? "Loading..." : "Load Tables"}
-      </Button>
-
-      <Divider sx={{ mt: 4, mb: 4 }} />
-
-      {error && <Alert severity="error" sx={{ mb: 3 }}>{error}</Alert>}
-
-      {migration.mysqlTables.length > 0 && (
-
-        <TableList
-          mysqlTables={migration.mysqlTables}
-          postgresTables={migration.postgresTables}
-          mappings={tableMappings}
-          setMappings={setTableMappings}
-          selectedTable={selectedTable}
-          onSelectTable={loadColumns}
-        />
-
-      )}
-
-      {columnLoading && <Alert severity="info" sx={{ mt: 3 }}>Loading columns...</Alert>}
-
-      {selectedTable && !columnLoading && (
-        <ColumnMapping
-          mysqlColumns={columns.mysql}
-          postgresColumns={columns.postgres}
-          mappings={columnMappings[selectedTable] || {}}
-          setMappings={(updater) =>
-            setColumnMappings((previous) => ({
-              ...previous,
-              [selectedTable]: typeof updater === "function"
-                ? updater(previous[selectedTable] || {})
-                : updater,
-            }))
-          }
-          mysqlTables={migration.mysqlTables}
-          postgresTables={migration.postgresTables}
-          mysqlConnection={mysqlConnection}
-          postgresConnection={postgresConnection}
-          selectedSchemas={selectedSchemas}
-          availableSchemas={schemas}
-        />
-      )}
-
-      {Object.keys(tableMappings).length > 0 && (
-        <>
-          <Divider sx={{ mt: 4, mb: 2 }} />
-
-          <Typography variant="h5" gutterBottom>
-            Selected-column pgloader files
-          </Typography>
-
-          {pgloaderFiles.config ? (
-            <Stack spacing={2}>
-              <Alert severity="info">
-                Download both files into the same folder, open a terminal there, and run
-                <code>chmod +x mysql-to-pgloader.sh &amp;&amp; ./mysql-to-pgloader.sh</code>. The script exports
-                only the selected fields and runs the native Linux pgloader command. Existing destination tables are
-                preserved; pgloader inserts into the columns you mapped.
-              </Alert>
-
-              <TextField
-                label="Generated .load file"
-                value={pgloaderFiles.config}
-                multiline
-                minRows={14}
-                fullWidth
-                InputProps={{ readOnly: true }}
-              />
-
-              <Stack direction="row" spacing={2}>
-                <Button variant="contained" onClick={downloadConfig}>Download .load file</Button>
-                <Button variant="contained" onClick={downloadExportScript}>Download export script</Button>
-                <Button variant="outlined" onClick={downloadLookupHelper}>Download lookup helper</Button>
-                <Button variant="outlined" onClick={copyConfig}>Copy configuration</Button>
-              </Stack>
-
-              {copyMessage && <Alert severity="info">{copyMessage}</Alert>}
-            </Stack>
-          ) : (
-            <Alert severity="info">{pgloaderFiles.error}</Alert>
-          )}
-        </>
-      )}
-
-      <Divider sx={{ mt: 4, mb: 2 }} />
-      <Typography variant="h5" gutterBottom>Run migration with Docker Desktop</Typography>
-      <Alert severity="info" sx={{ mb: 2 }}>
-        Runs the selected MySQL export and pgloader migration locally from Windows using Docker containers. Docker Desktop must be installed and running.
-      </Alert>
-      <Stack direction="row" spacing={2} alignItems="center">
-        <Button
-          variant="contained"
-          onClick={executeDockerMigration}
-          disabled={dockerRunning || !pgloaderFiles.dockerConfig || !pgloaderFiles.dockerScript}
-        >
-          {dockerRunning ? "Running migration..." : "Run with Docker"}
-        </Button>
-        {duplicatesLog && (
-          <Button variant="contained" color="warning" onClick={downloadDuplicatesLog}>
-            Download Duplicates Log
+          <Button
+            sx={{ mt: 3 }}
+            variant="contained"
+            size="large"
+            onClick={loadTables}
+            disabled={loading || !selectedSchemas.mysql || !selectedSchemas.postgres}
+          >
+            {loading ? "Loading..." : "Load Tables"}
           </Button>
-        )}
-      </Stack>
-      <TextField
-        sx={{ mt: 2 }}
-        label="Docker migration output"
-        value={dockerOutput}
-        multiline
-        minRows={12}
-        fullWidth
-        InputProps={{ readOnly: true }}
-      />
+
+          <Divider sx={{ mt: 4, mb: 4 }} />
+
+          {error && <Alert severity="error" sx={{ mb: 3 }}>{error}</Alert>}
+
+          {migration.mysqlTables.length > 0 && (
+
+            <TableList
+              mysqlTables={migration.mysqlTables}
+              postgresTables={migration.postgresTables}
+              mappings={tableMappings}
+              setMappings={setTableMappings}
+              selectedTable={selectedTable}
+              onSelectTable={loadColumns}
+            />
+
+          )}
+
+          {columnLoading && <Alert severity="info" sx={{ mt: 3 }}>Loading columns...</Alert>}
+
+          {selectedTable && !columnLoading && (
+            <ColumnMapping
+              mysqlColumns={columns.mysql}
+              postgresColumns={columns.postgres}
+              mappings={columnMappings[selectedTable] || {}}
+              setMappings={(updater) =>
+                setColumnMappings((previous) => ({
+                  ...previous,
+                  [selectedTable]: typeof updater === "function"
+                    ? updater(previous[selectedTable] || {})
+                    : updater,
+                }))
+              }
+              mysqlTables={migration.mysqlTables}
+              postgresTables={migration.postgresTables}
+              mysqlConnection={mysqlConnection}
+              postgresConnection={postgresConnection}
+              selectedSchemas={selectedSchemas}
+              availableSchemas={schemas}
+            />
+          )}
+
+          {Object.keys(tableMappings).length > 0 && (
+            <>
+              <Divider sx={{ mt: 4, mb: 2 }} />
+
+              <Typography variant="h5" gutterBottom>
+                Selected-column pgloader files
+              </Typography>
+
+              {pgloaderFiles.config ? (
+                <Stack spacing={2}>
+                  <Alert severity="info">
+                    Download both files into the same folder, open a terminal there, and run
+                    <code>chmod +x mysql-to-pgloader.sh &amp;&amp; ./mysql-to-pgloader.sh</code>. The script exports
+                    only the selected fields and runs the native Linux pgloader command. Existing destination tables are
+                    preserved; pgloader inserts into the columns you mapped.
+                  </Alert>
+
+                  <TextField
+                    label="Generated .load file"
+                    value={pgloaderFiles.config}
+                    multiline
+                    minRows={14}
+                    fullWidth
+                    InputProps={{ readOnly: true }}
+                  />
+
+                  <Stack direction="row" spacing={2}>
+                    <Button variant="contained" onClick={downloadConfig}>Download .load file</Button>
+                    <Button variant="contained" onClick={downloadExportScript}>Download export script</Button>
+                    <Button variant="outlined" onClick={downloadLookupHelper}>Download lookup helper</Button>
+                    <Button variant="outlined" onClick={copyConfig}>Copy configuration</Button>
+                  </Stack>
+
+                  {copyMessage && <Alert severity="info">{copyMessage}</Alert>}
+                </Stack>
+              ) : (
+                <Alert severity="info">{pgloaderFiles.error}</Alert>
+              )}
+            </>
+          )}
+
+          <Divider sx={{ mt: 4, mb: 2 }} />
+          <Typography variant="h5" gutterBottom>Run migration with Docker Desktop</Typography>
+          <Alert severity="info" sx={{ mb: 2 }}>
+            Runs the selected MySQL export and pgloader migration locally from Windows using Docker containers. Docker Desktop must be installed and running.
+          </Alert>
+
+          <Box sx={{ p: 2, mb: 2, bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(255,255,255,0.05)' : '#f8f9fa', borderRadius: 2, border: '1px solid', borderColor: 'divider' }}>
+            <Stack direction="row" spacing={2} alignItems="center" justifyContent="space-between">
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={limitRecords}
+                    onChange={(e) => setLimitRecords(e.target.checked)}
+                    color="primary"
+                  />
+                }
+                label={
+                  <Typography variant="body1" fontWeight={600}>
+                    Sample Dump Mode (Limit to 1,000 records)
+                  </Typography>
+                }
+              />
+              {limitRecords && (
+                <Chip
+                  label="1,000 Records Limit Active"
+                  color="warning"
+                  size="small"
+                  variant="filled"
+                  sx={{ fontWeight: 600 }}
+                />
+              )}
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              {limitRecords
+                ? "Fast testing mode enabled. Only the first 1,000 rows will be exported from each MySQL table."
+                : "Full dump mode. All records from the selected tables will be migrated."}
+            </Typography>
+          </Box>
+
+          <Stack direction="row" spacing={2} alignItems="center">
+            <Button
+              variant="contained"
+              onClick={executeDockerMigration}
+              disabled={dockerRunning || !pgloaderFiles.dockerConfig || !pgloaderFiles.dockerScript}
+            >
+              {dockerRunning ? "Running migration..." : "Run with Docker"}
+            </Button>
+            {dockerRunning && (
+              <Button
+                variant="contained"
+                color="error"
+                onClick={cancelMigration}
+                disabled={cancelling}
+              >
+                {cancelling ? "Cancelling..." : "Cancel Migration"}
+              </Button>
+            )}
+            {duplicatesLog && (
+              <Button variant="contained" color="warning" onClick={downloadDuplicatesLog}>
+                Download Duplicates Log
+              </Button>
+            )}
+          </Stack>
+          <TextField
+            sx={{ mt: 2 }}
+            label="Docker migration output"
+            value={dockerOutput}
+            multiline
+            minRows={12}
+            fullWidth
+            InputProps={{ readOnly: true }}
+          />
         </>
       )}
 

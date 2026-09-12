@@ -74,6 +74,9 @@ for offset in range(0, len(arguments), 6):
         value = value.strip()
         return value.casefold() if insensitive else value
 
+    backfill = old_path == "-"
+    value_map = old_path == "="
+
     new_ids = {}
     for row in rows(new_path):
         if len(row) < match_count + 1:
@@ -91,6 +94,14 @@ for offset in range(0, len(arguments), 6):
                 )
             continue
         new_ids[match] = result_id
+
+    if value_map:
+        jobs.append((column, source_indexes, normalized, None, new_ids, "value_map"))
+        continue
+
+    if backfill:
+        jobs.append((column, source_indexes, normalized, None, new_ids, "backfill"))
+        continue
 
     crosswalk = {}
     for row in rows(old_path):
@@ -121,7 +132,7 @@ for offset in range(0, len(arguments), 6):
                 )
             continue
         crosswalk[crosswalk_key] = result_id
-    jobs.append((column, source_indexes, normalized, crosswalk))
+    jobs.append((column, source_indexes, normalized, crosswalk, None, "crosswalk"))
 
 source = Path(data_path)
 temporary = source.with_suffix(source.suffix + ".lookup")
@@ -129,8 +140,43 @@ with source.open(encoding="utf-8-sig") as input_stream, temporary.open("w", enco
     for line_number, line in enumerate(input_stream):
         row = line.rstrip("\\r\\n").split("\\t")
         if line_number > 0:
-            for column, source_indexes, normalized, crosswalk in jobs:
-                if column >= len(row) or row[column] in ("", "\\\\N"):
+            for column, source_indexes, normalized, crosswalk, new_ids, mode in jobs:
+                if column >= len(row):
+                    continue
+                cell_is_empty = row[column].strip() in ("", "\\\\N", "\\\\\\\\N", "NULL", "null", "None") or row[column].strip().replace("\\\\\\\\", "") in ("", "N", "null", "NULL")
+                if mode == "backfill":
+                    if not cell_is_empty:
+                        continue
+                    backfill_key = tuple(normalized(row[index]) for index in source_indexes)
+                    if backfill_key not in new_ids:
+                        log_duplicate(
+                            f"[Missing Null Backfill Match for Data Row]\\n"
+                            f"Target Table: {source.name}\\n"
+                            f"Line Number: {line_number + 1}\\n"
+                            f"Input Match Key: {backfill_key!r}\\n"
+                            f"Status: Value kept as NULL\\n"
+                            f"----------------------------------------"
+                        )
+                        continue
+                    row[column] = new_ids[backfill_key]
+                    continue
+                if mode == "value_map":
+                    if cell_is_empty:
+                        continue
+                    relation_key = (normalized(row[column]),)
+                    if relation_key not in new_ids:
+                        log_duplicate(
+                            f"[Missing Relation Lookup for Data Row]\\n"
+                            f"Target Table: {source.name}\\n"
+                            f"Line Number: {line_number + 1}\\n"
+                            f"Relation Name: {row[column]!r}\\n"
+                            f"Status: Value kept as original '{row[column]}'\\n"
+                            f"----------------------------------------"
+                        )
+                        continue
+                    row[column] = new_ids[relation_key]
+                    continue
+                if cell_is_empty:
                     continue
                 crosswalk_key = (row[column], *(normalized(row[index]) for index in source_indexes))
                 if crosswalk_key not in crosswalk:
@@ -154,10 +200,11 @@ const sqlDefaultExpression = (value) => {
   if (normalized === "NULL") return "NULL";
   return quoteSqlLiteral(value);
 };
-const lookupMatchPairs = (lookup) => [
-  { mysqlColumn: lookup.mysqlMatchColumn, postgresColumn: lookup.postgresMatchColumn },
-  ...(lookup.additionalMatchColumns || []),
-];
+const lookupMatchPairs = (lookup) => (
+  lookup.mode === "backfill_null"
+    ? []
+    : [{ mysqlColumn: lookup.mysqlMatchColumn, postgresColumn: lookup.postgresMatchColumn }]
+);
 const lookupSourceMatchPairs = (lookup) => lookup.sourceMatchColumns || [];
 
 const cleanSource = (src) => src && src.includes("__dup__") ? src.split("__dup__")[0] : src;
@@ -221,7 +268,36 @@ const selectedColumnsForTable = (columnMappings, sourceTable) => {
     .filter(({ destination, value }) => destination && value !== "" && !mappedDestinations.has(destination))
     .map(({ destination, value }) => ({ destination, constantValue: value }));
 
-  return [...selectedColumns, ...splitColumns, ...defaultColumns];
+  const relationColumns = [];
+  const relationRows = mappings.__relationRows;
+  const hasRelationBranches = relationRows
+    && relationRows.active
+    && (relationRows.branches || []).some((branch) => branch.sourceColumn && branch.relationName);
+  if (hasRelationBranches) {
+    if (relationRows.nameColumn && !mappedDestinations.has(relationRows.nameColumn)) {
+      relationColumns.push({ destination: relationRows.nameColumn, isRelationName: true });
+      mappedDestinations.add(relationRows.nameColumn);
+    }
+    if (relationRows.relationIdColumn && !mappedDestinations.has(relationRows.relationIdColumn)) {
+      const relationConfig = relationRows.relation || {};
+      relationColumns.push({
+        destination: relationRows.relationIdColumn,
+        isRelationId: true,
+        lookup: {
+          mode: "value_map",
+          postgresSchema: relationConfig.postgresSchema || "",
+          postgresTable: relationConfig.postgresTable || "",
+          postgresMatchColumn: relationConfig.postgresMatchColumn || "",
+          postgresResultColumn: relationConfig.postgresResultColumn || "",
+          sourceMatchColumns: [],
+          caseInsensitive: Boolean(relationConfig.caseInsensitive),
+        },
+      });
+      mappedDestinations.add(relationRows.relationIdColumn);
+    }
+  }
+
+  return [...selectedColumns, ...splitColumns, ...defaultColumns, ...relationColumns];
 };
 
 const selectExpression = ({
@@ -313,30 +389,26 @@ const selectExpression = ({
     : `CASE ${sourceColumn} ${validReplacements
       .map(({ from, to }) => `WHEN ${quoteSqlLiteral(from)} THEN ${quoteSqlLiteral(to)}`)
       .join(" ")} ELSE ${sourceColumn} END`;
-  const isCode = (realSource && typeof realSource === "string" && (realSource.toLowerCase().includes("code") || realSource.toLowerCase().includes("bie"))) ||
-    (destination && typeof destination === "string" && (destination.toLowerCase().includes("code") || destination.toLowerCase().includes("bie")));
-  const processedValueExpression = isCode
-    ? `CASE WHEN ${valueExpression} REGEXP '^[0-9]+$' THEN ${valueExpression} ELSE 'N/A' END`
-    : valueExpression;
-
   const expressionWithDefault = defaultValue === ""
     ? (nullWhenEmpty
-      ? `CASE WHEN ${sourceColumn} IS NULL OR CAST(${sourceColumn} AS CHAR) = '' THEN ${quoteSqlLiteral("\\\\N")} ELSE ${processedValueExpression} END`
-      : processedValueExpression)
-    : `COALESCE(NULLIF(${processedValueExpression}, ''), ${sqlDefaultExpression(defaultValue)})`;
+      ? `CASE WHEN ${sourceColumn} IS NULL OR CAST(${sourceColumn} AS CHAR) = '' THEN ${quoteSqlLiteral("\\\\N")} ELSE ${valueExpression} END`
+      : valueExpression)
+    : `COALESCE(NULLIF(${valueExpression}, ''), ${sqlDefaultExpression(defaultValue)})`;
 
   return `${expressionWithDefault} AS ${quoteSqlIdentifier(destination)}`;
 };
 
-const buildQuery = (source, columns, mysqlSchema, rowDuplication) => {
+const buildQuery = (source, columns, mysqlSchema, rowDuplication, relationRows, limitRows = null) => {
+  const limitClause = (limitRows && Number(limitRows) > 0) ? ` LIMIT ${Number(limitRows)}` : "";
   if (source.startsWith("no table")) {
     const maxRows = Math.max(...columns.map(col => {
       const val = col.constantValue !== undefined ? col.constantValue : col.defaultValue;
       return String(val || "").split(",").map(s => s.trim()).length;
     }), 1);
+    const effectiveMaxRows = (limitRows && Number(limitRows) > 0) ? Math.min(maxRows, Number(limitRows)) : maxRows;
 
     const selectStatements = [];
-    for (let i = 0; i < maxRows; i++) {
+    for (let i = 0; i < effectiveMaxRows; i++) {
       const rowExpressions = columns.map(col => {
         const val = col.constantValue !== undefined ? col.constantValue : col.defaultValue;
         const valList = String(val || "").split(",").map(s => s.trim());
@@ -346,6 +418,74 @@ const buildQuery = (source, columns, mysqlSchema, rowDuplication) => {
       selectStatements.push(`SELECT ${rowExpressions.join(", ")}`);
     }
     return selectStatements.join(" UNION ALL ") + ";";
+  }
+
+  if (relationRows && relationRows.active) {
+    const branches = (relationRows.branches || []).filter(
+      (branch) => branch.sourceColumn && branch.relationName
+    );
+    const hasRelationTargets = columns.some((col) => col.isRelationName)
+      && columns.some((col) => col.isRelationId);
+    if (branches.length > 0 && hasRelationTargets) {
+      // Emit one target row per relationship branch while scanning the source
+      // table only once: cross join it to a tiny per-branch numbers table and
+      // select the branch's name expression / relationship label with CASE. The
+      // set of rows produced and every column expression are identical to a
+      // per-branch UNION ALL; only the row order in the exported .tsv differs
+      // (grouped per source row instead of per branch).
+      const branchTableAlias = quoteSqlIdentifier("__relation_branch__");
+      const branchNumberColumn = quoteSqlIdentifier("__branch_no__");
+      const branchRef = `${branchTableAlias}.${branchNumberColumn}`;
+
+      const stripAlias = (expression, destination) => {
+        const suffix = ` AS ${quoteSqlIdentifier(destination)}`;
+        return expression.endsWith(suffix) ? expression.slice(0, -suffix.length) : expression;
+      };
+
+      const selectList = columns
+        .map((col) => {
+          if (col.isRelationName) {
+            const cases = branches
+              .map((branch, index) => {
+                const inner = stripAlias(
+                  selectExpression({
+                    source: branch.sourceColumn,
+                    destination: col.destination,
+                    nullWhenEmpty: true,
+                  }),
+                  col.destination,
+                );
+                return `WHEN ${index + 1} THEN ${inner}`;
+              })
+              .join(" ");
+            return `CASE ${branchRef} ${cases} END AS ${quoteSqlIdentifier(col.destination)}`;
+          }
+          if (col.isRelationId) {
+            const cases = branches
+              .map((branch, index) => `WHEN ${index + 1} THEN ${sqlDefaultExpression(branch.relationName)}`)
+              .join(" ");
+            return `CASE ${branchRef} ${cases} END AS ${quoteSqlIdentifier(col.destination)}`;
+          }
+          return selectExpression(col);
+        })
+        .join(", ");
+
+      const branchNumbersTable = branches
+        .map((branch, index) => `SELECT ${index + 1} AS ${branchNumberColumn}`)
+        .join(" UNION ALL ");
+
+      let statement = `SELECT ${selectList} FROM ${quoteMysqlTable(mysqlSchema, source)} CROSS JOIN (${branchNumbersTable}) AS ${branchTableAlias}`;
+
+      if (relationRows.skipEmpty !== false) {
+        const conditions = branches.map((branch, index) => {
+          const sourceColumn = quoteSqlIdentifier(branch.sourceColumn);
+          return `(${branchRef} = ${index + 1} AND ${sourceColumn} IS NOT NULL AND TRIM(${sourceColumn}) <> '')`;
+        });
+        statement += ` WHERE ${conditions.join(" OR ")}`;
+      }
+
+      return `${statement}${limitClause};`;
+    }
   }
 
   if (rowDuplication && rowDuplication.active) {
@@ -373,10 +513,10 @@ const buildQuery = (source, columns, mysqlSchema, rowDuplication) => {
     const queryPrimary = `SELECT ${primaryColumns.map(selectExpression).join(", ")} FROM ${quoteMysqlTable(mysqlSchema, source)}`;
     const querySecondary = `SELECT ${secondaryColumns.map(selectExpression).join(", ")} FROM ${quoteMysqlTable(mysqlSchema, source)}`;
 
-    return `${queryPrimary} UNION ALL ${querySecondary};`;
+    return `(${queryPrimary}) UNION ALL (${querySecondary})${limitClause};`;
   }
 
-  return `SELECT ${columns.map(selectExpression).join(", ")} FROM ${quoteMysqlTable(mysqlSchema, source)};`;
+  return `SELECT ${columns.map(selectExpression).join(", ")} FROM ${quoteMysqlTable(mysqlSchema, source)}${limitClause};`;
 };
 
 export function generatePgloaderConfig({
@@ -385,6 +525,7 @@ export function generatePgloaderConfig({
   tableMappings,
   columnMappings,
   selectedSchemas,
+  limitRows = null,
 }) {
   const selectedTables = Object.entries(tableMappings)
     .filter(([, mapping]) => mapping.selected && mapping.destination)
@@ -393,6 +534,7 @@ export function generatePgloaderConfig({
       destination: mapping.destination,
       columns: selectedColumnsForTable(columnMappings, source),
       rowDuplication: columnMappings[source]?.__rowDuplication,
+      relationRows: columnMappings[source]?.__relationRows,
     }));
 
   if (selectedTables.length === 0) {
@@ -407,9 +549,33 @@ export function generatePgloaderConfig({
       error: `Map at least one column for: ${missingColumnMappings.map(({ source }) => source).join(", ")}.`,
     };
   }
-  const invalidLookups = selectedTables.flatMap(({ source, columns }) =>
-    columns
-      .filter(({ lookup }) => lookup && (![
+  const isBackfillConfigIncomplete = (config, columns) => {
+    const pairs = lookupSourceMatchPairs(config);
+    return (
+      ![config.postgresSchema, config.postgresTable, config.postgresResultColumn].every(Boolean)
+      || pairs.length === 0
+      || pairs.some(({ mysqlSourceColumn, postgresColumn }) => !mysqlSourceColumn || !postgresColumn)
+      || pairs.some(({ mysqlSourceColumn }) => !columns.some(({ source: mappedSource }) => cleanSource(mappedSource) === mysqlSourceColumn))
+    );
+  };
+  const isLookupIncomplete = (lookup, columns) => {
+    if (lookup.mode === "value_map") {
+      return ![
+        lookup.postgresSchema,
+        lookup.postgresTable,
+        lookup.postgresMatchColumn,
+        lookup.postgresResultColumn,
+      ].every(Boolean);
+    }
+    const sourcePairs = lookupSourceMatchPairs(lookup);
+    const sourcePairsInvalid =
+      sourcePairs.some(({ mysqlSourceColumn, postgresColumn }) => !mysqlSourceColumn || !postgresColumn)
+      || sourcePairs.some(({ mysqlSourceColumn }) => !columns.some(({ source: mappedSource }) => cleanSource(mappedSource) === mysqlSourceColumn));
+    if (lookup.mode === "backfill_null") {
+      return isBackfillConfigIncomplete(lookup, columns);
+    }
+    const crosswalkIncomplete = (
+      ![
         lookup.mysqlTable,
         lookup.mysqlIdColumn,
         lookup.mysqlMatchColumn,
@@ -418,9 +584,16 @@ export function generatePgloaderConfig({
         lookup.postgresMatchColumn,
         lookup.postgresResultColumn,
       ].every(Boolean)
-        || lookupMatchPairs(lookup).some(({ mysqlColumn, postgresColumn }) => !mysqlColumn || !postgresColumn)
-        || lookupSourceMatchPairs(lookup).some(({ mysqlSourceColumn, postgresColumn }) => !mysqlSourceColumn || !postgresColumn)
-        || lookupSourceMatchPairs(lookup).some(({ mysqlSourceColumn }) => !columns.some(({ source: mappedSource }) => cleanSource(mappedSource) === mysqlSourceColumn))))
+      || lookupMatchPairs(lookup).some(({ mysqlColumn, postgresColumn }) => !mysqlColumn || !postgresColumn)
+      || sourcePairsInvalid
+    );
+    if (crosswalkIncomplete) return true;
+    if (lookup.alsoBackfillNull) return isBackfillConfigIncomplete(lookup.backfill || {}, columns);
+    return false;
+  };
+  const invalidLookups = selectedTables.flatMap(({ source, columns }) =>
+    columns
+      .filter(({ lookup }) => lookup && isLookupIncomplete(lookup, columns))
       .map(({ destination }) => `${source}.${destination}`)
   );
   if (invalidLookups.length > 0) {
@@ -469,8 +642,8 @@ export function generatePgloaderConfig({
     : mysqlConnection.host;
   const dockerConfigCommands = makeConfigCommands(dockerPostgresConnection);
 
-  const exportCommands = selectedTables.map(({ source, columns, rowDuplication }) => {
-    const query = buildQuery(source, columns, selectedSchemas.mysql, rowDuplication);
+  const exportCommands = selectedTables.map(({ source, columns, rowDuplication, relationRows }) => {
+    const query = buildQuery(source, columns, selectedSchemas.mysql, rowDuplication, relationRows, limitRows);
     const outputPath = `pgloader-data/${source}.tsv`;
     return [
       "mysql --batch \\",
@@ -480,12 +653,22 @@ export function generatePgloaderConfig({
     ].join("\n");
   });
   const lookupJobs = selectedTables.flatMap(({ source, columns }) =>
-    columns.map((column, index) => ({ source, column, index })).filter(({ column }) => column.lookup)
+    columns.flatMap((column, index) => {
+      if (!column.lookup) return [];
+      const entries = [{ source, column, index }];
+      if (column.lookup.mode !== "backfill_null" && column.lookup.alsoBackfillNull) {
+        entries.push({ source, column, index, backfillOnly: true });
+      }
+      return entries;
+    })
   );
-  const lookupJobDetails = lookupJobs.map(({ source, column, index }, jobIndex) => {
+  const lookupJobDetails = lookupJobs.map(({ source, column, index, backfillOnly }, jobIndex) => {
     const lookup = column.lookup;
-    const lookupPairs = lookupMatchPairs(lookup);
-    const sourcePairs = lookupSourceMatchPairs(lookup);
+    const isBackfill = backfillOnly || lookup.mode === "backfill_null";
+    const isValueMap = !backfillOnly && lookup.mode === "value_map";
+    const settings = backfillOnly ? (lookup.backfill || {}) : lookup;
+    const lookupPairs = isBackfill ? [] : lookupMatchPairs(lookup);
+    const sourcePairs = lookupSourceMatchPairs(settings);
     const matchPairs = [...lookupPairs, ...sourcePairs];
     const sourceIndexes = sourcePairs.map(({ mysqlSourceColumn }) => selectedTables.find(({ source: table }) => table === source).columns.findIndex(({ source: field }) => cleanSource(field) === mysqlSourceColumn));
     const cleanMysql = (expr) => `REPLACE(REPLACE(REPLACE(CAST(${expr} AS CHAR), '\\\\r', ' '), '\\\\n', ' '), '\\\\t', ' ')`;
@@ -497,30 +680,36 @@ export function generatePgloaderConfig({
       ...sourcePairs.map(({ mysqlSourceColumn }) => cleanMysql(`${quoteSqlIdentifier("s")}.${quoteSqlIdentifier(mysqlSourceColumn)}`)),
     ];
     const realColumnSource = cleanSource(column.source);
-    const oldQuery = `SELECT DISTINCT ${oldColumns.join(", ")} FROM ${quoteMysqlTable(lookup.mysqlSchema || selectedSchemas.mysql, lookup.mysqlTable)} AS ${quoteSqlIdentifier("l")} JOIN ${quoteMysqlTable(selectedSchemas.mysql, source)} AS ${quoteSqlIdentifier("s")} ON ${quoteSqlIdentifier("s")}.${quoteSqlIdentifier(realColumnSource)} = ${quoteSqlIdentifier("l")}.${quoteSqlIdentifier(lookup.mysqlIdColumn)};`;
+    const oldQuery = (isBackfill || isValueMap)
+      ? ""
+      : `SELECT DISTINCT ${oldColumns.join(", ")} FROM ${quoteMysqlTable(lookup.mysqlSchema || selectedSchemas.mysql, lookup.mysqlTable)} AS ${quoteSqlIdentifier("l")} JOIN ${quoteMysqlTable(selectedSchemas.mysql, source)} AS ${quoteSqlIdentifier("s")} ON ${quoteSqlIdentifier("s")}.${quoteSqlIdentifier(realColumnSource)} = ${quoteSqlIdentifier("l")}.${quoteSqlIdentifier(lookup.mysqlIdColumn)};`;
 
     const pgColumns = [
       ...matchPairs.map(({ postgresColumn }) => cleanPg(quotePgIdentifier(postgresColumn))),
-      quotePgIdentifier(lookup.postgresResultColumn),
+      quotePgIdentifier(settings.postgresResultColumn),
     ];
-    const pgQuery = `SELECT ${pgColumns.join(", ")} FROM ${quotePgTable(lookup.postgresSchema, lookup.postgresTable)};`;
+    const pgQuery = `SELECT ${pgColumns.join(", ")} FROM ${quotePgTable(settings.postgresSchema, settings.postgresTable)};`;
     return {
       source,
       arguments: [
         index,
-        `pgloader-data/lookup-old-${jobIndex}.tsv`,
+        isBackfill ? "-" : isValueMap ? "=" : `pgloader-data/lookup-old-${jobIndex}.tsv`,
         `pgloader-data/lookup-new-${jobIndex}.tsv`,
         matchPairs.length,
         sourceIndexes.join(",") || "-",
-        lookup.caseInsensitive ? 1 : 0,
+        settings.caseInsensitive ? 1 : 0,
       ],
       linuxCommands: [
-        `mysql --batch --raw --skip-column-names ${quoteBash(`--host=${mysqlConnection.host}`)} ${quoteBash(`--port=${mysqlConnection.port}`)} ${quoteBash(`--user=${mysqlConnection.username}`)} ${quoteBash(`--database=${mysqlConnection.database}`)} ${quoteBash(`--execute=${oldQuery}`)} > ${quoteBash(`pgloader-data/lookup-old-${jobIndex}.tsv`)}`,
+        ...((isBackfill || isValueMap) ? [] : [
+          `mysql --batch --raw --skip-column-names ${quoteBash(`--host=${mysqlConnection.host}`)} ${quoteBash(`--port=${mysqlConnection.port}`)} ${quoteBash(`--user=${mysqlConnection.username}`)} ${quoteBash(`--database=${mysqlConnection.database}`)} ${quoteBash(`--execute=${oldQuery}`)} > ${quoteBash(`pgloader-data/lookup-old-${jobIndex}.tsv`)}`,
+        ]),
         `PGPASSWORD=${quoteBash(postgresConnection.password)} psql ${quoteBash(`--host=${postgresConnection.host}`)} ${quoteBash(`--port=${postgresConnection.port}`)} ${quoteBash(`--username=${postgresConnection.username}`)} ${quoteBash(`--dbname=${postgresConnection.database}`)} --no-align --tuples-only --field-separator=$'\\t' --command=${quoteBash(pgQuery)} > ${quoteBash(`pgloader-data/lookup-new-${jobIndex}.tsv`)}`,
       ],
       dockerCommands: [
-        `docker exec -e MYSQL_PWD $mysqlClient mysql --batch --raw --skip-column-names --host=${dockerMysqlHost} --port=${mysqlConnection.port} --user=${mysqlConnection.username} --database=${mysqlConnection.database} --execute=${quotePowerShell(oldQuery)} | Out-File ${quotePowerShell(`pgloader-data/lookup-old-${jobIndex}.tsv`)} -Encoding utf8`,
-        "if ($LASTEXITCODE -ne 0) { throw 'MySQL lookup export failed.' }",
+        ...((isBackfill || isValueMap) ? [] : [
+          `docker exec -e MYSQL_PWD $mysqlClient mysql --batch --raw --skip-column-names --host=${dockerMysqlHost} --port=${mysqlConnection.port} --user=${mysqlConnection.username} --database=${mysqlConnection.database} --execute=${quotePowerShell(oldQuery)} | Out-File ${quotePowerShell(`pgloader-data/lookup-old-${jobIndex}.tsv`)} -Encoding utf8`,
+          "if ($LASTEXITCODE -ne 0) { throw 'MySQL lookup export failed.' }",
+        ]),
         `$env:PGPASSWORD = ${quotePowerShell(postgresConnection.password)}`,
         `docker exec -e PGPASSWORD $postgresClient psql --host=${dockerPostgresConnection.host} --port=${postgresConnection.port} --username=${postgresConnection.username} --dbname=${postgresConnection.database} --no-align --tuples-only --field-separator=$tab --command=${quotePowerShell(pgQuery)} | Out-File ${quotePowerShell(`pgloader-data/lookup-new-${jobIndex}.tsv`)} -Encoding utf8`,
         "if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL lookup export failed.' }",
@@ -534,8 +723,8 @@ export function generatePgloaderConfig({
     const argumentsText = jobs.flatMap(({ arguments: values }) => values.map(quoteBash)).join(" ");
     return [`python3 lookup-transform.py ${quoteBash(`pgloader-data/${source}.tsv`)} ${argumentsText}`];
   });
-  const dockerExportCommands = selectedTables.map(({ source, columns, rowDuplication }) => {
-    const query = buildQuery(source, columns, selectedSchemas.mysql, rowDuplication);
+  const dockerExportCommands = selectedTables.map(({ source, columns, rowDuplication, relationRows }) => {
+    const query = buildQuery(source, columns, selectedSchemas.mysql, rowDuplication, relationRows, limitRows);
     return [
       "docker exec -e MYSQL_PWD $mysqlClient mysql --batch `",
       `  --host=${dockerMysqlHost} --port=${mysqlConnection.port} \``,
@@ -560,8 +749,15 @@ export function generatePgloaderConfig({
     "export_pids+=(\"$!\")",
     "if (( ${#export_pids[@]} >= export_jobs )); then wait \"${export_pids[0]}\"; export_pids=(\"${export_pids[@]:1}\"); fi",
   ]);
-  const lookupIndexAdvice = lookupJobs.map(({ source, column }) => {
+  const lookupIndexAdvice = lookupJobs.map(({ source, column, backfillOnly }) => {
     const lookup = column.lookup;
+    if (backfillOnly || lookup.mode === "backfill_null") {
+      const config = backfillOnly ? (lookup.backfill || {}) : lookup;
+      return `# Performance check: index PostgreSQL match columns on ${config.postgresSchema}.${config.postgresTable} used to backfill NULL ${source}.${column.destination}.`;
+    }
+    if (lookup.mode === "value_map") {
+      return `# Performance check: index PostgreSQL relation lookup column ${lookup.postgresSchema}.${lookup.postgresTable}.${lookup.postgresMatchColumn} used to resolve ${source}.${column.destination}.`;
+    }
     return `# Performance check: index ${lookup.mysqlSchema || selectedSchemas.mysql}.${lookup.mysqlTable}.${lookup.mysqlIdColumn} and ${selectedSchemas.mysql}.${source}.${column.source}; also index PostgreSQL lookup match columns on ${lookup.postgresSchema}.${lookup.postgresTable}.`;
   });
 
@@ -668,3 +864,4 @@ export function generatePgloaderConfig({
     error: "",
   };
 }
+

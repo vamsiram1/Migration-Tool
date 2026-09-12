@@ -1330,8 +1330,6 @@ def execute_id_remapping(req: IdRemapExecuteRequest) -> IdRemapExecuteResponse:
                 else:
                     # Standard sequential swap / remap execution
                     total_swaps = 0
-                    total_displaces = 0
-                    displaced_details = []
                     unique_parent_rows_touched = set()
 
                     for step_idx, (old_id, new_id) in enumerate(raw_mappings):
