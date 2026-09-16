@@ -35,9 +35,19 @@ import {
   Tune as SettingsIcon,
 } from "@mui/icons-material";
 import { useState, useEffect } from "react";
-import { mysqlColumns as loadMysqlColumns, mysqlTables as loadMysqlTables, postgresColumns as loadPostgresColumns, postgresTables as loadPostgresTables } from "../services/database";
+import {
+  mysqlColumns as loadMysqlColumns,
+  mysqlTables as loadMysqlTables,
+  postgresColumns as loadPostgresColumns,
+  postgresTables as loadPostgresTables,
+  mysqlDistinctValues as loadMysqlDistinctValues,
+  postgresMasterRows as loadPostgresMasterRows,
+} from "../services/database";
+
+const cleanSourceColumnName = (name) => (name.includes("__dup__") ? name.split("__dup__")[0] : name);
 
 export default function ColumnMapping({
+  selectedTable,
   mysqlColumns,
   postgresColumns,
   mappings,
@@ -52,6 +62,10 @@ export default function ColumnMapping({
   const [lookupColumns, setLookupColumns] = useState({});
   const [lookupTables, setLookupTables] = useState({});
   const [activeLookupKey, setActiveLookupKey] = useState(null);
+  const [masterTableColumns, setMasterTableColumns] = useState({});
+  const [masterTableTables, setMasterTableTables] = useState({});
+  const [masterRowOptions, setMasterRowOptions] = useState({});
+  const [distinctValuesLoading, setDistinctValuesLoading] = useState({});
 
   useEffect(() => {
     const preloadLookupOptions = async () => {
@@ -172,6 +186,111 @@ export default function ColumnMapping({
     }
   }, [mappings, selectedSchemas.postgres, postgresConnection]);
 
+  useEffect(() => {
+    const preloadMasterTableTables = async () => {
+      const wanted = [
+        ...Object.entries(mappings)
+          .filter(([, mapping]) => mapping && mapping.masterTable)
+          .map(([key, mapping]) => [key, mapping.masterTable]),
+        ...(mappings.__valueMappings || [])
+          .map((group, groupIndex) => [`__valueMappings:${groupIndex}`, group.masterTable])
+          .filter(([, masterTable]) => Boolean(masterTable)),
+      ];
+      for (const [key, masterTable] of wanted) {
+        const schema = masterTable.schema || selectedSchemas.postgres;
+        if (!schema || masterTableTables[key]?.signature === schema) continue;
+        try {
+          const res = await loadPostgresTables({ ...postgresConnection, schema_name: schema });
+          setMasterTableTables((prev) => ({ ...prev, [key]: { signature: schema, tables: res.data } }));
+        } catch (e) {
+          console.error("Failed to load master tables for schema", e);
+        }
+      }
+    };
+    preloadMasterTableTables();
+  }, [mappings, mappings.__valueMappings, selectedSchemas.postgres, postgresConnection]);
+
+  useEffect(() => {
+    const preloadMasterTableColumns = async () => {
+      for (const [key, mapping] of Object.entries(mappings)) {
+        const masterTable = mapping && mapping.masterTable;
+        if (!masterTable || !masterTable.table || masterTableColumns[key]) continue;
+        try {
+          const res = await loadPostgresColumns({
+            ...postgresConnection,
+            schema_name: masterTable.schema || selectedSchemas.postgres,
+            table_name: masterTable.table,
+          });
+          setMasterTableColumns((prev) => ({ ...prev, [key]: res.data }));
+        } catch (e) {
+          console.error("Failed to load master table columns", e);
+        }
+      }
+    };
+    preloadMasterTableColumns();
+  }, [mappings, selectedSchemas.postgres, postgresConnection]);
+
+  useEffect(() => {
+    const preloadMasterRows = async () => {
+      for (const [key, mapping] of Object.entries(mappings)) {
+        const masterTable = mapping && mapping.masterTable;
+        if (!masterTable || !masterTable.table || !masterTable.idColumn || !masterTable.displayColumn) continue;
+        const signature = `${masterTable.schema || selectedSchemas.postgres}.${masterTable.table}.${masterTable.idColumn}.${masterTable.displayColumn}`;
+        if (masterRowOptions[key]?.signature === signature) continue;
+        try {
+          const res = await loadPostgresMasterRows({
+            ...postgresConnection,
+            schema_name: masterTable.schema || selectedSchemas.postgres,
+            table_name: masterTable.table,
+            id_column: masterTable.idColumn,
+            display_column: masterTable.displayColumn,
+          });
+          setMasterRowOptions((prev) => ({ ...prev, [key]: { signature, rows: res.data } }));
+        } catch (e) {
+          console.error("Failed to load master table rows", e);
+        }
+      }
+    };
+    preloadMasterRows();
+  }, [mappings, selectedSchemas.postgres, postgresConnection]);
+
+  useEffect(() => {
+    const preloadGroupMasterData = async () => {
+      for (const [groupIndex, group] of (mappings.__valueMappings || []).entries()) {
+        const masterTable = group && group.masterTable;
+        if (!masterTable || !masterTable.table) continue;
+        const key = `__valueMappings:${groupIndex}`;
+        const schema = masterTable.schema || selectedSchemas.postgres;
+        if (!masterTableColumns[key]) {
+          try {
+            const res = await loadPostgresColumns({ ...postgresConnection, schema_name: schema, table_name: masterTable.table });
+            setMasterTableColumns((prev) => ({ ...prev, [key]: res.data }));
+          } catch (e) {
+            console.error("Failed to load master table columns", e);
+          }
+        }
+        if (masterTable.idColumn && masterTable.displayColumn) {
+          const signature = `${schema}.${masterTable.table}.${masterTable.idColumn}.${masterTable.displayColumn}`;
+          if (masterRowOptions[key]?.signature !== signature) {
+            try {
+              const res = await loadPostgresMasterRows({
+                ...postgresConnection,
+                schema_name: schema,
+                table_name: masterTable.table,
+                id_column: masterTable.idColumn,
+                display_column: masterTable.displayColumn,
+              });
+              setMasterRowOptions((prev) => ({ ...prev, [key]: { signature, rows: res.data } }));
+            } catch (e) {
+              console.error("Failed to load master table rows", e);
+            }
+          }
+        }
+      }
+    };
+    preloadGroupMasterData();
+  }, [mappings.__valueMappings, selectedSchemas.postgres, postgresConnection]);
+
   const addColumnMappingDuplicate = (columnName) => {
     let index = 1;
     while (`${columnName}__dup__${index}` in mappings) {
@@ -215,7 +334,7 @@ export default function ColumnMapping({
     const mapping = mappings[column] || {};
     updateMapping(column, "replacements", [
       ...(mapping.replacements || []),
-      { from: "", to: "" },
+      { from: "", to: "", condition: "EQUALS" },
     ]);
   };
 
@@ -233,6 +352,78 @@ export default function ColumnMapping({
       "replacements",
       (mapping.replacements || []).filter((_, replacementIndex) => replacementIndex !== index)
     );
+  };
+
+  const updateMasterTable = (column, field, value) => {
+    const mapping = mappings[column] || {};
+    const nextMasterTable = {
+      schema: selectedSchemas.postgres,
+      table: "",
+      idColumn: "",
+      displayColumn: "",
+      ...mapping.masterTable,
+      [field]: value,
+    };
+    if (field === "schema") {
+      nextMasterTable.table = "";
+      nextMasterTable.idColumn = "";
+      nextMasterTable.displayColumn = "";
+    }
+    if (field === "table") {
+      nextMasterTable.idColumn = "";
+      nextMasterTable.displayColumn = "";
+    }
+    // Any of these changes invalidates previously fetched columns/rows for this
+    // master table - clear them so a stale (e.g. numeric-labelled) result never
+    // lingers in the "Target value" dropdown after the config changes.
+    if (field === "schema" || field === "table") {
+      setMasterTableColumns((prev) => ({ ...prev, [column]: undefined }));
+    }
+    setMasterRowOptions((prev) => ({ ...prev, [column]: undefined }));
+    updateMapping(column, "masterTable", nextMasterTable);
+  };
+
+  const removeMasterTable = (column) => {
+    setMasterTableColumns((prev) => ({ ...prev, [column]: undefined }));
+    setMasterRowOptions((prev) => ({ ...prev, [column]: undefined }));
+    updateMapping(column, "masterTable", null);
+  };
+
+  const loadDistinctValuesForColumn = async (column) => {
+    if (!selectedTable || !selectedSchemas.mysql) return;
+    setDistinctValuesLoading((prev) => ({ ...prev, [column]: true }));
+    try {
+      const res = await loadMysqlDistinctValues({
+        ...mysqlConnection,
+        schema_name: selectedSchemas.mysql,
+        table_name: selectedTable,
+        column_name: cleanSourceColumnName(column),
+      });
+      const { values = [], has_null: hasNull } = res.data || {};
+      const mapping = mappings[column] || {};
+      const existing = mapping.replacements || [];
+      const existingKeys = new Set(
+        existing.map((r) => (r.condition === "IS_NULL" ? "IS_NULL" : `EQUALS:${r.from}`))
+      );
+      const additions = [];
+      values.forEach((value) => {
+        const key = `EQUALS:${value}`;
+        if (!existingKeys.has(key)) {
+          existingKeys.add(key);
+          additions.push({ from: String(value), to: "", condition: "EQUALS" });
+        }
+      });
+      if (hasNull && !existingKeys.has("IS_NULL")) {
+        additions.push({ from: "", to: "", condition: "IS_NULL" });
+      }
+      if (additions.length > 0) {
+        updateMapping(column, "replacements", [...existing, ...additions]);
+      }
+    } catch (e) {
+      console.error("Failed to load distinct source values", e);
+    } finally {
+      setDistinctValuesLoading((prev) => ({ ...prev, [column]: false }));
+    }
   };
 
   const enableLookupReplacement = (column) => {
@@ -445,6 +636,129 @@ export default function ColumnMapping({
         (_, defaultIndex) => defaultIndex !== index
       ),
     }));
+  };
+
+  // Condition-based value mapping: lets several source columns (e.g. a status
+  // code column AND an amount column) each contribute rules that resolve to one
+  // target column's master-table id. Rules within a group are evaluated in the
+  // order shown, first match wins - this is the deterministic precedence rule
+  // for when more than one condition could otherwise apply to the same row.
+  const addValueMapping = () => {
+    setMappings((previous) => ({
+      ...previous,
+      __valueMappings: [
+        ...(previous.__valueMappings || []),
+        {
+          targetColumn: "",
+          masterTable: { schema: selectedSchemas.postgres, table: "", idColumn: "", displayColumn: "" },
+          rules: [],
+        },
+      ],
+    }));
+  };
+
+  const updateValueMapping = (groupIndex, field, value) => {
+    setMappings((previous) => {
+      const groups = [...(previous.__valueMappings || [])];
+      groups[groupIndex] = { ...groups[groupIndex], [field]: value };
+      return { ...previous, __valueMappings: groups };
+    });
+  };
+
+  const updateValueMappingMaster = (groupIndex, field, value) => {
+    const key = `__valueMappings:${groupIndex}`;
+    setMappings((previous) => {
+      const groups = [...(previous.__valueMappings || [])];
+      const group = groups[groupIndex] || {};
+      const nextMaster = {
+        schema: selectedSchemas.postgres,
+        table: "",
+        idColumn: "",
+        displayColumn: "",
+        ...group.masterTable,
+        [field]: value,
+      };
+      if (field === "schema") {
+        nextMaster.table = "";
+        nextMaster.idColumn = "";
+        nextMaster.displayColumn = "";
+      }
+      if (field === "table") {
+        nextMaster.idColumn = "";
+        nextMaster.displayColumn = "";
+      }
+      groups[groupIndex] = { ...group, masterTable: nextMaster };
+      return { ...previous, __valueMappings: groups };
+    });
+    // Same staleness fix as the per-column picker: any change here invalidates
+    // previously fetched columns/rows so the Target value dropdown never shows
+    // leftover results from a different table/column combination.
+    if (field === "schema" || field === "table") {
+      setMasterTableColumns((prev) => ({ ...prev, [key]: undefined }));
+    }
+    setMasterRowOptions((prev) => ({ ...prev, [key]: undefined }));
+  };
+
+  const removeValueMapping = (groupIndex) => {
+    const key = `__valueMappings:${groupIndex}`;
+    setMasterTableColumns((prev) => ({ ...prev, [key]: undefined }));
+    setMasterRowOptions((prev) => ({ ...prev, [key]: undefined }));
+    setMappings((previous) => ({
+      ...previous,
+      __valueMappings: (previous.__valueMappings || []).filter((_, index) => index !== groupIndex),
+    }));
+  };
+
+  const addValueMappingRule = (groupIndex) => {
+    setMappings((previous) => {
+      const groups = [...(previous.__valueMappings || [])];
+      const group = groups[groupIndex] || { rules: [] };
+      groups[groupIndex] = {
+        ...group,
+        rules: [...(group.rules || []), { sourceColumn: "", condition: "EQUALS", value: "", targetId: "" }],
+      };
+      return { ...previous, __valueMappings: groups };
+    });
+  };
+
+  const updateValueMappingRule = (groupIndex, ruleIndex, field, value) => {
+    setMappings((previous) => {
+      const groups = [...(previous.__valueMappings || [])];
+      const group = groups[groupIndex] || { rules: [] };
+      const rules = [...(group.rules || [])];
+      rules[ruleIndex] = { ...rules[ruleIndex], [field]: value };
+      groups[groupIndex] = { ...group, rules };
+      return { ...previous, __valueMappings: groups };
+    });
+  };
+
+  const removeValueMappingRule = (groupIndex, ruleIndex) => {
+    setMappings((previous) => {
+      const groups = [...(previous.__valueMappings || [])];
+      const group = groups[groupIndex] || { rules: [] };
+      groups[groupIndex] = { ...group, rules: (group.rules || []).filter((_, index) => index !== ruleIndex) };
+      return { ...previous, __valueMappings: groups };
+    });
+  };
+
+  const [ruleDistinctValues, setRuleDistinctValues] = useState({});
+
+  const loadDistinctValuesForRuleColumn = async (sourceColumn) => {
+    if (!selectedTable || !selectedSchemas.mysql || !sourceColumn) return;
+    setDistinctValuesLoading((prev) => ({ ...prev, [`rule:${sourceColumn}`]: true }));
+    try {
+      const res = await loadMysqlDistinctValues({
+        ...mysqlConnection,
+        schema_name: selectedSchemas.mysql,
+        table_name: selectedTable,
+        column_name: cleanSourceColumnName(sourceColumn),
+      });
+      setRuleDistinctValues((prev) => ({ ...prev, [sourceColumn]: res.data }));
+    } catch (e) {
+      console.error("Failed to load distinct source values", e);
+    } finally {
+      setDistinctValuesLoading((prev) => ({ ...prev, [`rule:${sourceColumn}`]: false }));
+    }
   };
 
   const updateRowDuplication = (field, value) => {
@@ -765,46 +1079,187 @@ export default function ColumnMapping({
 
                       <TableCell>
                         <Stack spacing={1.5}>
-                          {(mapping.replacements || []).map((replacement, index) => (
-                            <Stack direction="row" spacing={1} key={index} alignItems="center">
-                              <TextField
-                                label="If value is"
-                                size="small"
-                                value={replacement.from}
-                                onChange={(event) =>
-                                  updateReplacement(key, index, "from", event.target.value)
-                                }
-                                sx={{ flex: 1 }}
-                              />
-                              <TextField
-                                label="Write"
-                                size="small"
-                                value={replacement.to}
-                                onChange={(event) =>
-                                  updateReplacement(key, index, "to", event.target.value)
-                                }
-                                sx={{ flex: 1 }}
-                              />
-                              <IconButton
-                                aria-label="Remove data modification"
-                                color="error"
-                                size="small"
-                                onClick={() => removeReplacement(key, index)}
-                              >
-                                <DeleteIcon fontSize="small" />
-                              </IconButton>
-                            </Stack>
-                          ))}
-                          <Button
-                            size="small"
-                            variant="text"
-                            startIcon={<AddIcon fontSize="small" />}
-                            onClick={() => addReplacement(key)}
-                            disabled={!mapping.selected || !mapping.destination}
-                            sx={{ textTransform: "none", alignSelf: "flex-start", p: 0, fontSize: "0.8rem" }}
-                          >
-                            + Add replacement
-                          </Button>
+                          {mapping.masterTable ? (
+                            <Paper variant="outlined" sx={{ p: 1, borderRadius: 1.5 }}>
+                              <Stack spacing={1}>
+                                <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+                                  <Typography variant="caption" fontWeight={600}>
+                                    Master table
+                                  </Typography>
+                                  <IconButton
+                                    aria-label="Stop using a master table"
+                                    size="small"
+                                    onClick={() => removeMasterTable(key)}
+                                  >
+                                    <CloseIcon fontSize="small" />
+                                  </IconButton>
+                                </Stack>
+                                <FormControl fullWidth size="small">
+                                  <InputLabel>Schema</InputLabel>
+                                  <Select
+                                    label="Schema"
+                                    value={mapping.masterTable.schema || selectedSchemas.postgres || ""}
+                                    onChange={(e) => updateMasterTable(key, "schema", e.target.value)}
+                                  >
+                                    {availableSchemas.postgres.map((schema) => (
+                                      <MenuItem key={schema.schema_name} value={schema.schema_name}>{schema.schema_name}</MenuItem>
+                                    ))}
+                                  </Select>
+                                </FormControl>
+                                <FormControl fullWidth size="small">
+                                  <InputLabel>Table</InputLabel>
+                                  <Select
+                                    label="Table"
+                                    value={mapping.masterTable.table || ""}
+                                    onChange={(e) => updateMasterTable(key, "table", e.target.value)}
+                                  >
+                                    {(masterTableTables[key]?.tables || []).map((t) => (
+                                      <MenuItem key={t.table_name} value={t.table_name}>{t.table_name}</MenuItem>
+                                    ))}
+                                  </Select>
+                                </FormControl>
+                                <Stack direction="row" spacing={1}>
+                                  <FormControl fullWidth size="small">
+                                    <InputLabel>ID column (stored)</InputLabel>
+                                    <Select
+                                      label="ID column (stored)"
+                                      value={mapping.masterTable.idColumn || ""}
+                                      onChange={(e) => updateMasterTable(key, "idColumn", e.target.value)}
+                                    >
+                                      {(masterTableColumns[key] || []).map((c) => (
+                                        <MenuItem
+                                          key={c.column_name}
+                                          value={c.column_name}
+                                          disabled={c.column_name === mapping.masterTable.displayColumn}
+                                        >
+                                          {c.column_name}
+                                        </MenuItem>
+                                      ))}
+                                    </Select>
+                                  </FormControl>
+                                  <FormControl fullWidth size="small">
+                                    <InputLabel>Display column (shown)</InputLabel>
+                                    <Select
+                                      label="Display column (shown)"
+                                      value={mapping.masterTable.displayColumn || ""}
+                                      onChange={(e) => updateMasterTable(key, "displayColumn", e.target.value)}
+                                    >
+                                      {(masterTableColumns[key] || []).map((c) => (
+                                        <MenuItem
+                                          key={c.column_name}
+                                          value={c.column_name}
+                                          disabled={c.column_name === mapping.masterTable.idColumn}
+                                        >
+                                          {c.column_name}
+                                        </MenuItem>
+                                      ))}
+                                    </Select>
+                                  </FormControl>
+                                </Stack>
+                                <Typography variant="caption" color="text.secondary">
+                                  ID column is the value written to the target column. Display column is only the
+                                  readable text shown in the "Target value" dropdown below - pick your table's
+                                  name/label/status text column here, not the ID column.
+                                </Typography>
+                              </Stack>
+                            </Paper>
+                          ) : (
+                            <Button
+                              size="small"
+                              variant="text"
+                              onClick={() => updateMasterTable(key, "table", "")}
+                              disabled={!mapping.selected || !mapping.destination}
+                              sx={{ textTransform: "none", alignSelf: "flex-start", p: 0, fontSize: "0.78rem" }}
+                            >
+                              Use a master table for values
+                            </Button>
+                          )}
+
+                          {(mapping.replacements || []).map((replacement, index) => {
+                            const masterRows = masterRowOptions[key]?.rows || [];
+                            const isNullCondition = replacement.condition === "IS_NULL";
+                            return (
+                              <Stack direction="row" spacing={1} key={index} alignItems="center">
+                                <FormControl size="small" sx={{ width: 110 }}>
+                                  <Select
+                                    value={replacement.condition || "EQUALS"}
+                                    onChange={(event) =>
+                                      updateReplacement(key, index, "condition", event.target.value)
+                                    }
+                                  >
+                                    <MenuItem value="EQUALS">Equals</MenuItem>
+                                    <MenuItem value="IS_NULL">Is NULL</MenuItem>
+                                  </Select>
+                                </FormControl>
+                                <TextField
+                                  label="If value is"
+                                  size="small"
+                                  value={isNullCondition ? "" : replacement.from}
+                                  disabled={isNullCondition}
+                                  placeholder={isNullCondition ? "NULL" : ""}
+                                  onChange={(event) =>
+                                    updateReplacement(key, index, "from", event.target.value)
+                                  }
+                                  sx={{ flex: 1 }}
+                                />
+                                {mapping.masterTable ? (
+                                  <FormControl size="small" sx={{ flex: 1 }}>
+                                    <InputLabel>Target value</InputLabel>
+                                    <Select
+                                      label="Target value"
+                                      value={replacement.to || ""}
+                                      onChange={(event) =>
+                                        updateReplacement(key, index, "to", event.target.value)
+                                      }
+                                    >
+                                      {masterRows.map((row) => (
+                                        <MenuItem key={row.id} value={String(row.id)}>{row.label}</MenuItem>
+                                      ))}
+                                    </Select>
+                                  </FormControl>
+                                ) : (
+                                  <TextField
+                                    label="Write"
+                                    size="small"
+                                    value={replacement.to}
+                                    onChange={(event) =>
+                                      updateReplacement(key, index, "to", event.target.value)
+                                    }
+                                    sx={{ flex: 1 }}
+                                  />
+                                )}
+                                <IconButton
+                                  aria-label="Remove data modification"
+                                  color="error"
+                                  size="small"
+                                  onClick={() => removeReplacement(key, index)}
+                                >
+                                  <DeleteIcon fontSize="small" />
+                                </IconButton>
+                              </Stack>
+                            );
+                          })}
+                          <Stack direction="row" spacing={1.5} alignItems="center">
+                            <Button
+                              size="small"
+                              variant="text"
+                              startIcon={<AddIcon fontSize="small" />}
+                              onClick={() => addReplacement(key)}
+                              disabled={!mapping.selected || !mapping.destination}
+                              sx={{ textTransform: "none", alignSelf: "flex-start", p: 0, fontSize: "0.8rem" }}
+                            >
+                              + Add replacement
+                            </Button>
+                            <Button
+                              size="small"
+                              variant="text"
+                              onClick={() => loadDistinctValuesForColumn(key)}
+                              disabled={!mapping.selected || !mapping.destination || !selectedTable || distinctValuesLoading[key]}
+                              sx={{ textTransform: "none", alignSelf: "flex-start", p: 0, fontSize: "0.8rem" }}
+                            >
+                              {distinctValuesLoading[key] ? "Loading..." : "Load distinct source values"}
+                            </Button>
+                          </Stack>
                           <TextField
                             label="New value if input is empty or NULL"
                             size="small"
@@ -977,6 +1432,219 @@ export default function ColumnMapping({
           })}
           <Button variant="outlined" onClick={addPostgresDefault}>
             Add PostgreSQL default
+          </Button>
+        </Stack>
+
+        <Divider sx={{ my: 3 }} />
+
+        <Stack spacing={2}>
+          <Typography variant="h6">Value / condition → master table ID mapping</Typography>
+          <Typography variant="body2" color="text.secondary">
+            Map distinct values (or conditions like "is NULL") from one or more MySQL columns to a row picked from a
+            PostgreSQL master table. Rules run top to bottom; the first one that matches a row wins, so order sets the
+            precedence when more than one rule could apply.
+          </Typography>
+
+          {(mappings.__valueMappings || []).map((group, groupIndex) => {
+            const masterKey = `__valueMappings:${groupIndex}`;
+            const masterCols = masterTableColumns[masterKey] || [];
+            const masterRows = masterRowOptions[masterKey]?.rows || [];
+            const otherGroupTargets = new Set(
+              (mappings.__valueMappings || [])
+                .filter((_, i) => i !== groupIndex)
+                .map((g) => g.targetColumn)
+            );
+            return (
+              <Paper key={groupIndex} variant="outlined" sx={{ p: 2, borderRadius: 1.5 }}>
+                <Stack spacing={2}>
+                  <Stack direction="row" spacing={2} alignItems="center" justifyContent="space-between">
+                    <FormControl sx={{ minWidth: 220 }} size="small">
+                      <InputLabel>Target column</InputLabel>
+                      <Select
+                        label="Target column"
+                        value={group.targetColumn || ""}
+                        onChange={(e) => updateValueMapping(groupIndex, "targetColumn", e.target.value)}
+                      >
+                        {postgresColumns.map((column) => (
+                          <MenuItem
+                            key={column.column_name}
+                            value={column.column_name}
+                          >
+                            {column.column_name} ({column.data_type})
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <Button size="small" color="error" onClick={() => removeValueMapping(groupIndex)}>
+                      Remove mapping group
+                    </Button>
+                  </Stack>
+
+                  <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
+                    <FormControl fullWidth size="small">
+                      <InputLabel>Master schema</InputLabel>
+                      <Select
+                        label="Master schema"
+                        value={group.masterTable?.schema || selectedSchemas.postgres || ""}
+                        onChange={(e) => updateValueMappingMaster(groupIndex, "schema", e.target.value)}
+                      >
+                        {availableSchemas.postgres.map((schema) => (
+                          <MenuItem key={schema.schema_name} value={schema.schema_name}>{schema.schema_name}</MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <FormControl fullWidth size="small">
+                      <InputLabel>Master table</InputLabel>
+                      <Select
+                        label="Master table"
+                        value={group.masterTable?.table || ""}
+                        onChange={(e) => updateValueMappingMaster(groupIndex, "table", e.target.value)}
+                      >
+                        {(masterTableTables[masterKey]?.tables || []).map((t) => (
+                          <MenuItem key={t.table_name} value={t.table_name}>{t.table_name}</MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <FormControl fullWidth size="small">
+                      <InputLabel>Master ID column (stored)</InputLabel>
+                      <Select
+                        label="Master ID column (stored)"
+                        value={group.masterTable?.idColumn || ""}
+                        onChange={(e) => updateValueMappingMaster(groupIndex, "idColumn", e.target.value)}
+                      >
+                        {masterCols.map((c) => (
+                          <MenuItem
+                            key={c.column_name}
+                            value={c.column_name}
+                            disabled={c.column_name === group.masterTable?.displayColumn}
+                          >
+                            {c.column_name}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <FormControl fullWidth size="small">
+                      <InputLabel>Master display column (shown)</InputLabel>
+                      <Select
+                        label="Master display column (shown)"
+                        value={group.masterTable?.displayColumn || ""}
+                        onChange={(e) => updateValueMappingMaster(groupIndex, "displayColumn", e.target.value)}
+                      >
+                        {masterCols.map((c) => (
+                          <MenuItem
+                            key={c.column_name}
+                            value={c.column_name}
+                            disabled={c.column_name === group.masterTable?.idColumn}
+                          >
+                            {c.column_name}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                  </Stack>
+                  <Typography variant="caption" color="text.secondary">
+                    ID column is the value written to the target column. Display column is only the readable text
+                    shown in each rule's "Target value" dropdown below - pick your table's name/label/status text
+                    column here, not the ID column.
+                  </Typography>
+
+                  <Stack spacing={1.5}>
+                    {(group.rules || []).map((rule, ruleIndex) => {
+                      const isNullCondition = rule.condition === "IS_NULL";
+                      const isZeroCondition = rule.condition === "IS_ZERO";
+                      const isSpecialCondition = isNullCondition || isZeroCondition;
+                      const distinctInfo = ruleDistinctValues[rule.sourceColumn];
+                      const distinctListId = `value-mapping-${groupIndex}-${ruleIndex}-values`;
+                      return (
+                        <Stack direction="row" spacing={1} alignItems="center" key={ruleIndex}>
+                          <FormControl size="small" sx={{ minWidth: 160 }}>
+                            <InputLabel>Source column</InputLabel>
+                            <Select
+                              label="Source column"
+                              value={rule.sourceColumn || ""}
+                              onChange={(e) => updateValueMappingRule(groupIndex, ruleIndex, "sourceColumn", e.target.value)}
+                            >
+                              {mysqlColumns.map((column) => (
+                                <MenuItem key={column.column_name} value={column.column_name}>
+                                  {column.column_name}
+                                </MenuItem>
+                              ))}
+                            </Select>
+                          </FormControl>
+                          <FormControl size="small" sx={{ width: 110 }}>
+                            <Select
+                              value={rule.condition || "EQUALS"}
+                              onChange={(e) => updateValueMappingRule(groupIndex, ruleIndex, "condition", e.target.value)}
+                            >
+                              <MenuItem value="EQUALS">Equals</MenuItem>
+                              <MenuItem value="IS_NULL">Is NULL</MenuItem>
+                              <MenuItem value="IS_ZERO">Is 0</MenuItem>
+                            </Select>
+                          </FormControl>
+                          <TextField
+                            label="Value"
+                            size="small"
+                            value={isNullCondition ? "" : isZeroCondition ? "0" : (rule.value || "")}
+                            disabled={isSpecialCondition}
+                            placeholder={isNullCondition ? "NULL" : isZeroCondition ? "0" : ""}
+                            onChange={(e) => updateValueMappingRule(groupIndex, ruleIndex, "value", e.target.value)}
+                            inputProps={{ list: distinctInfo ? distinctListId : undefined }}
+                            sx={{ flex: 1 }}
+                          />
+                          {distinctInfo && (
+                            <datalist id={distinctListId}>
+                              {distinctInfo.values.map((value) => (
+                                <option key={String(value)} value={value} />
+                              ))}
+                            </datalist>
+                          )}
+                          <Button
+                            size="small"
+                            sx={{ textTransform: "none", fontSize: "0.72rem" }}
+                            disabled={!rule.sourceColumn || !selectedTable || distinctValuesLoading[`rule:${rule.sourceColumn}`]}
+                            onClick={() => loadDistinctValuesForRuleColumn(rule.sourceColumn)}
+                          >
+                            {distinctValuesLoading[`rule:${rule.sourceColumn}`] ? "..." : "Load values"}
+                          </Button>
+                          <FormControl size="small" sx={{ flex: 1 }}>
+                            <InputLabel>Target value</InputLabel>
+                            <Select
+                              label="Target value"
+                              value={rule.targetId || ""}
+                              onChange={(e) => updateValueMappingRule(groupIndex, ruleIndex, "targetId", e.target.value)}
+                            >
+                              {masterRows.map((row) => (
+                                <MenuItem key={row.id} value={String(row.id)}>{row.label}</MenuItem>
+                              ))}
+                            </Select>
+                          </FormControl>
+                          <IconButton
+                            aria-label="Remove rule"
+                            color="error"
+                            size="small"
+                            onClick={() => removeValueMappingRule(groupIndex, ruleIndex)}
+                          >
+                            <DeleteIcon fontSize="small" />
+                          </IconButton>
+                        </Stack>
+                      );
+                    })}
+                    <Button
+                      size="small"
+                      variant="text"
+                      startIcon={<AddIcon fontSize="small" />}
+                      onClick={() => addValueMappingRule(groupIndex)}
+                      sx={{ textTransform: "none", alignSelf: "flex-start", p: 0, fontSize: "0.8rem" }}
+                    >
+                      + Add rule
+                    </Button>
+                  </Stack>
+                </Stack>
+              </Paper>
+            );
+          })}
+          <Button variant="outlined" onClick={addValueMapping}>
+            Add value mapping group
           </Button>
         </Stack>
 
@@ -1488,109 +2156,109 @@ export default function ColumnMapping({
                   <Stack direction={{ xs: "column", md: "row" }} spacing={2.5}>
                     {/* MySQL Source Side */}
                     {lookup.mode !== "backfill_null" && (
-                    <Box
-                      sx={{
-                        flex: 1,
-                        p: 2,
-                        borderRadius: 2,
-                        bgcolor: (theme) =>
-                          theme.palette.mode === "dark"
-                            ? "rgba(255,255,255,0.03)"
-                            : "#ffffff",
-                        border: 1,
-                        borderColor: "info.light",
-                        boxShadow: "0 1px 4px rgba(0,0,0,0.04)",
-                      }}
-                    >
-                      <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2 }}>
-                        <Chip
-                          label="MySQL (Source)"
-                          size="small"
-                          color="info"
-                          variant="filled"
-                          sx={{ fontWeight: 700, height: 24, fontSize: "0.75rem" }}
-                        />
-                        <Typography variant="caption" color="text.secondary" fontWeight={500}>
-                          Old Table & Columns
-                        </Typography>
-                      </Stack>
+                      <Box
+                        sx={{
+                          flex: 1,
+                          p: 2,
+                          borderRadius: 2,
+                          bgcolor: (theme) =>
+                            theme.palette.mode === "dark"
+                              ? "rgba(255,255,255,0.03)"
+                              : "#ffffff",
+                          border: 1,
+                          borderColor: "info.light",
+                          boxShadow: "0 1px 4px rgba(0,0,0,0.04)",
+                        }}
+                      >
+                        <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2 }}>
+                          <Chip
+                            label="MySQL (Source)"
+                            size="small"
+                            color="info"
+                            variant="filled"
+                            sx={{ fontWeight: 700, height: 24, fontSize: "0.75rem" }}
+                          />
+                          <Typography variant="caption" color="text.secondary" fontWeight={500}>
+                            Old Table & Columns
+                          </Typography>
+                        </Stack>
 
-                      <Stack spacing={2}>
-                        <FormControl size="small" fullWidth>
-                          <InputLabel>MySQL schema</InputLabel>
-                          <Select
-                            label="MySQL schema"
-                            value={lookup.mysqlSchema || selectedSchemas.mysql}
-                            onChange={(event) =>
-                              selectMysqlLookupSchema(key, event.target.value)
-                            }
-                          >
-                            {availableSchemas.mysql.map((schema) => (
-                              <MenuItem key={schema.schema_name} value={schema.schema_name}>
-                                {schema.schema_name}
-                              </MenuItem>
-                            ))}
-                          </Select>
-                        </FormControl>
+                        <Stack spacing={2}>
+                          <FormControl size="small" fullWidth>
+                            <InputLabel>MySQL schema</InputLabel>
+                            <Select
+                              label="MySQL schema"
+                              value={lookup.mysqlSchema || selectedSchemas.mysql}
+                              onChange={(event) =>
+                                selectMysqlLookupSchema(key, event.target.value)
+                              }
+                            >
+                              {availableSchemas.mysql.map((schema) => (
+                                <MenuItem key={schema.schema_name} value={schema.schema_name}>
+                                  {schema.schema_name}
+                                </MenuItem>
+                              ))}
+                            </Select>
+                          </FormControl>
 
-                        <FormControl size="small" fullWidth>
-                          <InputLabel>MySQL lookup table</InputLabel>
-                          <Select
-                            label="MySQL lookup table"
-                            value={lookup.mysqlTable || ""}
-                            onChange={(event) =>
-                              selectMysqlLookupTable(key, event.target.value)
-                            }
-                          >
-                            {(
-                              lookupTables[key]?.mysql ||
-                              ((lookup.mysqlSchema || selectedSchemas.mysql) ===
-                                selectedSchemas.mysql
-                                ? mysqlTables
-                                : [])
-                            ).map((table) => (
-                              <MenuItem key={table.table_name} value={table.table_name}>
-                                {table.table_name}
-                              </MenuItem>
-                            ))}
-                          </Select>
-                        </FormControl>
+                          <FormControl size="small" fullWidth>
+                            <InputLabel>MySQL lookup table</InputLabel>
+                            <Select
+                              label="MySQL lookup table"
+                              value={lookup.mysqlTable || ""}
+                              onChange={(event) =>
+                                selectMysqlLookupTable(key, event.target.value)
+                              }
+                            >
+                              {(
+                                lookupTables[key]?.mysql ||
+                                ((lookup.mysqlSchema || selectedSchemas.mysql) ===
+                                  selectedSchemas.mysql
+                                  ? mysqlTables
+                                  : [])
+                              ).map((table) => (
+                                <MenuItem key={table.table_name} value={table.table_name}>
+                                  {table.table_name}
+                                </MenuItem>
+                              ))}
+                            </Select>
+                          </FormControl>
 
-                        <FormControl size="small" fullWidth>
-                          <InputLabel>MySQL old ID column</InputLabel>
-                          <Select
-                            label="MySQL old ID column"
-                            value={lookup.mysqlIdColumn || ""}
-                            onChange={(event) =>
-                              updateLookup(key, "mysqlIdColumn", event.target.value)
-                            }
-                          >
-                            {(lookupColumns[key]?.mysql || []).map((item) => (
-                              <MenuItem key={item.column_name} value={item.column_name}>
-                                {item.column_name} ({item.data_type})
-                              </MenuItem>
-                            ))}
-                          </Select>
-                        </FormControl>
+                          <FormControl size="small" fullWidth>
+                            <InputLabel>MySQL old ID column</InputLabel>
+                            <Select
+                              label="MySQL old ID column"
+                              value={lookup.mysqlIdColumn || ""}
+                              onChange={(event) =>
+                                updateLookup(key, "mysqlIdColumn", event.target.value)
+                              }
+                            >
+                              {(lookupColumns[key]?.mysql || []).map((item) => (
+                                <MenuItem key={item.column_name} value={item.column_name}>
+                                  {item.column_name} ({item.data_type})
+                                </MenuItem>
+                              ))}
+                            </Select>
+                          </FormControl>
 
-                        <FormControl size="small" fullWidth>
-                          <InputLabel>MySQL matching value column</InputLabel>
-                          <Select
-                            label="MySQL matching value column"
-                            value={lookup.mysqlMatchColumn || ""}
-                            onChange={(event) =>
-                              updateLookup(key, "mysqlMatchColumn", event.target.value)
-                            }
-                          >
-                            {(lookupColumns[key]?.mysql || []).map((item) => (
-                              <MenuItem key={item.column_name} value={item.column_name}>
-                                {item.column_name} ({item.data_type})
-                              </MenuItem>
-                            ))}
-                          </Select>
-                        </FormControl>
-                      </Stack>
-                    </Box>
+                          <FormControl size="small" fullWidth>
+                            <InputLabel>MySQL matching value column</InputLabel>
+                            <Select
+                              label="MySQL matching value column"
+                              value={lookup.mysqlMatchColumn || ""}
+                              onChange={(event) =>
+                                updateLookup(key, "mysqlMatchColumn", event.target.value)
+                              }
+                            >
+                              {(lookupColumns[key]?.mysql || []).map((item) => (
+                                <MenuItem key={item.column_name} value={item.column_name}>
+                                  {item.column_name} ({item.data_type})
+                                </MenuItem>
+                              ))}
+                            </Select>
+                          </FormControl>
+                        </Stack>
+                      </Box>
                     )}
 
                     {/* PostgreSQL Target Side */}
@@ -1665,22 +2333,22 @@ export default function ColumnMapping({
                         </FormControl>
 
                         {lookup.mode !== "backfill_null" && (
-                        <FormControl size="small" fullWidth>
-                          <InputLabel>PostgreSQL matching value column</InputLabel>
-                          <Select
-                            label="PostgreSQL matching value column"
-                            value={lookup.postgresMatchColumn || ""}
-                            onChange={(event) =>
-                              updateLookup(key, "postgresMatchColumn", event.target.value)
-                            }
-                          >
-                            {(lookupColumns[key]?.postgres || []).map((item) => (
-                              <MenuItem key={item.column_name} value={item.column_name}>
-                                {item.column_name} ({item.data_type})
-                              </MenuItem>
-                            ))}
-                          </Select>
-                        </FormControl>
+                          <FormControl size="small" fullWidth>
+                            <InputLabel>PostgreSQL matching value column</InputLabel>
+                            <Select
+                              label="PostgreSQL matching value column"
+                              value={lookup.postgresMatchColumn || ""}
+                              onChange={(event) =>
+                                updateLookup(key, "postgresMatchColumn", event.target.value)
+                              }
+                            >
+                              {(lookupColumns[key]?.postgres || []).map((item) => (
+                                <MenuItem key={item.column_name} value={item.column_name}>
+                                  {item.column_name} ({item.data_type})
+                                </MenuItem>
+                              ))}
+                            </Select>
+                          </FormControl>
                         )}
 
                         <FormControl size="small" fullWidth>

@@ -214,7 +214,13 @@ const selectedColumnsForTable = (columnMappings, sourceTable) => {
   const selectedColumns = Object.entries(mappings)
     .filter(([source]) => !source.startsWith("__"))
     .filter(([, mapping]) => mapping.selected && mapping.destination)
-    .map(([source, mapping]) => ({ source, ...mapping }));
+    .map(([source, mapping]) => ({
+      source,
+      ...mapping,
+      valueMappingRules: (mappings.__valueMappings || [])
+        .filter((group) => group.targetColumn === mapping.destination && (group.rules || []).length > 0)
+        .flatMap((group) => group.rules || []),
+    }));
   const mappedDestinations = new Set(selectedColumns.map(({ destination }) => destination));
 
   const splitColumns = [];
@@ -297,7 +303,18 @@ const selectedColumnsForTable = (columnMappings, sourceTable) => {
     }
   }
 
-  return [...selectedColumns, ...splitColumns, ...defaultColumns, ...relationColumns];
+  // Condition-based value mapping: one or more source columns (e.g. a status
+  // code AND an amount column) each contribute rules resolving to the same
+  // target column's master-table id. Skipped entirely if unconfigured, so
+  // migrations that don't use this feature are unaffected.
+  const valueMappingColumns = (mappings.__valueMappings || [])
+    .filter(({ targetColumn, rules }) => targetColumn && !mappedDestinations.has(targetColumn) && (rules || []).length > 0)
+    .map(({ targetColumn, rules }) => {
+      mappedDestinations.add(targetColumn);
+      return { destination: targetColumn, isValueMapping: true, rules: rules || [] };
+    });
+
+  return [...selectedColumns, ...splitColumns, ...defaultColumns, ...relationColumns, ...valueMappingColumns];
 };
 
 const selectExpression = ({
@@ -309,11 +326,35 @@ const selectExpression = ({
   lookup,
   nullWhenEmpty = true,
   isSplit,
+  isValueMapping,
+  rules,
+  valueMappingRules = [],
   delimiter,
   matchType,
   pattern,
   partIndex,
 }) => {
+  if (isValueMapping) {
+    const validRules = (rules || []).filter(
+      ({ sourceColumn, condition, value, targetId }) =>
+        sourceColumn && targetId !== "" && targetId !== undefined
+        && (condition === "IS_NULL" || condition === "IS_ZERO" || (value !== "" && value !== undefined))
+    );
+    if (validRules.length === 0) {
+      return `${quoteSqlLiteral("\\\\N")} AS ${quoteSqlIdentifier(destination)}`;
+    }
+    const whenClauses = validRules.map(({ sourceColumn, condition, value, targetId }) => {
+      const column = quoteSqlIdentifier(cleanSource(sourceColumn));
+      if (condition === "IS_NULL") {
+        return `WHEN ${column} IS NULL THEN ${quoteSqlLiteral(targetId)}`;
+      }
+      if (condition === "IS_ZERO") {
+        return `WHEN ${column} = 0 OR ${column} = '0' THEN ${quoteSqlLiteral(targetId)}`;
+      }
+      return `WHEN ${column} = ${quoteSqlLiteral(value)} THEN ${quoteSqlLiteral(targetId)}`;
+    });
+    return `CASE ${whenClauses.join(" ")} ELSE ${quoteSqlLiteral("\\\\N")} END AS ${quoteSqlIdentifier(destination)}`;
+  }
   if (source === undefined) {
     return `${sqlDefaultExpression(constantValue)} AS ${quoteSqlIdentifier(destination)}`;
   }
@@ -383,19 +424,53 @@ const selectExpression = ({
     }
   }
   const sourceColumn = quoteSqlIdentifier(realSource);
-  const validReplacements = replacements.filter(({ from, to }) => from !== "" && to !== "");
+  const validReplacements = replacements.filter(
+    ({ from, to, condition }) => to !== "" && (condition === "IS_NULL" || (from !== "" && from !== undefined))
+  );
+  // Searched CASE (rather than simple `CASE sourceColumn WHEN ...`) so an IS_NULL
+  // condition can be expressed alongside EQUALS conditions; for configs with only
+  // EQUALS conditions this evaluates identically to the previous simple CASE form.
   const valueExpression = lookup || validReplacements.length === 0
     ? sourceColumn
-    : `CASE ${sourceColumn} ${validReplacements
-      .map(({ from, to }) => `WHEN ${quoteSqlLiteral(from)} THEN ${quoteSqlLiteral(to)}`)
+    : `CASE ${validReplacements
+      .map(({ from, to, condition }) => condition === "IS_NULL"
+        ? `WHEN ${sourceColumn} IS NULL THEN ${quoteSqlLiteral(to)}`
+        : `WHEN ${sourceColumn} = ${quoteSqlLiteral(from)} THEN ${quoteSqlLiteral(to)}`)
       .join(" ")} ELSE ${sourceColumn} END`;
+  // A configured IS_NULL replacement means the user wants NULL routed to a specific
+  // value (e.g. a master-table id) instead of being collapsed to "\N" here.
+  const hasNullReplacement = validReplacements.some(({ condition }) => condition === "IS_NULL");
   const expressionWithDefault = defaultValue === ""
     ? (nullWhenEmpty
-      ? `CASE WHEN ${sourceColumn} IS NULL OR CAST(${sourceColumn} AS CHAR) = '' THEN ${quoteSqlLiteral("\\\\N")} ELSE ${valueExpression} END`
+      ? (hasNullReplacement
+        ? `CASE WHEN CAST(${sourceColumn} AS CHAR) = '' THEN ${quoteSqlLiteral("\\\\N")} ELSE ${valueExpression} END`
+        : `CASE WHEN ${sourceColumn} IS NULL OR CAST(${sourceColumn} AS CHAR) = '' THEN ${quoteSqlLiteral("\\\\N")} ELSE ${valueExpression} END`)
       : valueExpression)
     : `COALESCE(NULLIF(${valueExpression}, ''), ${sqlDefaultExpression(defaultValue)})`;
 
-  return `${expressionWithDefault} AS ${quoteSqlIdentifier(destination)}`;
+  let finalExpression = expressionWithDefault;
+  if (valueMappingRules && valueMappingRules.length > 0) {
+    const validGroupRules = valueMappingRules.filter(
+      ({ sourceColumn: srcCol, condition, value, targetId }) =>
+        srcCol && targetId !== "" && targetId !== undefined
+        && (condition === "IS_NULL" || condition === "IS_ZERO" || (value !== "" && value !== undefined))
+    );
+    if (validGroupRules.length > 0) {
+      const whenClauses = validGroupRules.map(({ sourceColumn: srcCol, condition, value, targetId }) => {
+        const colIdent = quoteSqlIdentifier(cleanSource(srcCol));
+        if (condition === "IS_NULL") {
+          return `WHEN ${colIdent} IS NULL THEN ${quoteSqlLiteral(targetId)}`;
+        }
+        if (condition === "IS_ZERO") {
+          return `WHEN ${colIdent} = 0 OR ${colIdent} = '0' THEN ${quoteSqlLiteral(targetId)}`;
+        }
+        return `WHEN ${colIdent} = ${quoteSqlLiteral(value)} THEN ${quoteSqlLiteral(targetId)}`;
+      });
+      finalExpression = `CASE ${whenClauses.join(" ")} ELSE ${expressionWithDefault} END`;
+    }
+  }
+
+  return `${finalExpression} AS ${quoteSqlIdentifier(destination)}`;
 };
 
 const buildQuery = (source, columns, mysqlSchema, rowDuplication, relationRows, limitRows = null) => {
@@ -600,6 +675,64 @@ export function generatePgloaderConfig({
     return { config: "", exportScript: "", error: `Complete lookup settings for: ${invalidLookups.join(", ")}.` };
   }
 
+  // Value/condition -> master-table-id replacements: when a master table is
+  // configured, every rule must resolve to a picked master id, and a value or
+  // NULL condition must not be configured twice with conflicting targets.
+  const invalidReplacementColumns = [];
+  selectedTables.forEach(({ source, columns }) => {
+    columns.forEach(({ destination, masterTable, replacements: columnReplacements = [] }) => {
+      if (!masterTable) return;
+      const seen = new Set();
+      const incomplete = columnReplacements.some(({ from, to, condition }) => {
+        const key = condition === "IS_NULL" ? "IS_NULL" : `EQUALS:${from}`;
+        if (seen.has(key)) return true;
+        seen.add(key);
+        return to === "" || to === undefined || (condition !== "IS_NULL" && (from === "" || from === undefined));
+      });
+      if (incomplete) invalidReplacementColumns.push(`${source}.${destination}`);
+    });
+  });
+  if (invalidReplacementColumns.length > 0) {
+    return {
+      config: "",
+      exportScript: "",
+      error: `Complete or de-duplicate value mapping rules for: ${invalidReplacementColumns.join(", ")}.`,
+    };
+  }
+
+  const invalidValueMappingGroups = [];
+  Object.entries(tableMappings)
+    .filter(([, mapping]) => mapping.selected && mapping.destination)
+    .forEach(([source]) => {
+      (columnMappings[source]?.__valueMappings || []).forEach((group, index) => {
+        if (!group.targetColumn || (group.rules || []).length === 0) return;
+        const label = `${source} (rule group ${index + 1} → ${group.targetColumn || "?"})`;
+        const seen = new Set();
+        const invalid = group.rules.some(({ sourceColumn, condition, value, targetId }) => {
+          const key = condition === "IS_NULL"
+            ? `${sourceColumn}:IS_NULL`
+            : condition === "IS_ZERO"
+              ? `${sourceColumn}:IS_ZERO`
+              : `${sourceColumn}:EQUALS:${value}`;
+          if (seen.has(key)) return true;
+          seen.add(key);
+          return (
+            !sourceColumn
+            || targetId === "" || targetId === undefined
+            || (condition !== "IS_NULL" && condition !== "IS_ZERO" && (value === "" || value === undefined))
+          );
+        });
+        if (invalid) invalidValueMappingGroups.push(label);
+      });
+    });
+  if (invalidValueMappingGroups.length > 0) {
+    return {
+      config: "",
+      exportScript: "",
+      error: `Complete or de-duplicate value mapping rules for: ${invalidValueMappingGroups.join(", ")}.`,
+    };
+  }
+
   const makeConfigCommands = (targetConnection) => selectedTables.map(({ source, destination, columns }) => {
     const targetColumns = columns.map(({ destination: column }) => quotePgIdentifier(column)).join(", ");
     const sourceFields = columns
@@ -680,40 +813,123 @@ export function generatePgloaderConfig({
       ...sourcePairs.map(({ mysqlSourceColumn }) => cleanMysql(`${quoteSqlIdentifier("s")}.${quoteSqlIdentifier(mysqlSourceColumn)}`)),
     ];
     const realColumnSource = cleanSource(column.source);
+    const sourceNeededCols = Array.from(
+      new Set([realColumnSource, ...sourcePairs.map(({ mysqlSourceColumn }) => cleanSource(mysqlSourceColumn))])
+    ).filter(Boolean).map(quoteSqlIdentifier).join(", ");
+    const sourceTableExpr = (limitRows && Number(limitRows) > 0 && sourceNeededCols && !source.startsWith("no table"))
+      ? `(SELECT ${sourceNeededCols} FROM ${quoteMysqlTable(selectedSchemas.mysql, source)} LIMIT ${Number(limitRows)})`
+      : quoteMysqlTable(selectedSchemas.mysql, source);
     const oldQuery = (isBackfill || isValueMap)
       ? ""
-      : `SELECT DISTINCT ${oldColumns.join(", ")} FROM ${quoteMysqlTable(lookup.mysqlSchema || selectedSchemas.mysql, lookup.mysqlTable)} AS ${quoteSqlIdentifier("l")} JOIN ${quoteMysqlTable(selectedSchemas.mysql, source)} AS ${quoteSqlIdentifier("s")} ON ${quoteSqlIdentifier("s")}.${quoteSqlIdentifier(realColumnSource)} = ${quoteSqlIdentifier("l")}.${quoteSqlIdentifier(lookup.mysqlIdColumn)};`;
+      : `SELECT DISTINCT ${oldColumns.join(", ")} FROM ${quoteMysqlTable(lookup.mysqlSchema || selectedSchemas.mysql, lookup.mysqlTable)} AS ${quoteSqlIdentifier("l")} JOIN ${sourceTableExpr} AS ${quoteSqlIdentifier("s")} ON ${quoteSqlIdentifier("s")}.${quoteSqlIdentifier(realColumnSource)} = ${quoteSqlIdentifier("l")}.${quoteSqlIdentifier(lookup.mysqlIdColumn)};`;
 
     const pgColumns = [
       ...matchPairs.map(({ postgresColumn }) => cleanPg(quotePgIdentifier(postgresColumn))),
       quotePgIdentifier(settings.postgresResultColumn),
     ];
     const pgQuery = `SELECT ${pgColumns.join(", ")} FROM ${quotePgTable(settings.postgresSchema, settings.postgresTable)};`;
+    const matchWhereCols = matchPairs.length === 1
+      ? quotePgIdentifier(matchPairs[0].postgresColumn)
+      : matchPairs.map(({ postgresColumn }) => quotePgIdentifier(postgresColumn)).join(", ");
+    const oldTsvPath = `pgloader-data/lookup-old-${jobIndex}.tsv`;
+    const newTsvPath = `pgloader-data/lookup-new-${jobIndex}.tsv`;
+
+    const linuxCommands = (isBackfill || isValueMap)
+      ? [
+        `PGPASSWORD=${quoteBash(postgresConnection.password)} psql ${quoteBash(`--host=${postgresConnection.host}`)} ${quoteBash(`--port=${postgresConnection.port}`)} ${quoteBash(`--username=${postgresConnection.username}`)} ${quoteBash(`--dbname=${postgresConnection.database}`)} --no-align --tuples-only --field-separator=$'\\t' --command=${quoteBash(pgQuery)} > ${quoteBash(newTsvPath)}`,
+      ]
+      : [
+        `mysql --batch --raw --skip-column-names ${quoteBash(`--host=${mysqlConnection.host}`)} ${quoteBash(`--port=${mysqlConnection.port}`)} ${quoteBash(`--user=${mysqlConnection.username}`)} ${quoteBash(`--database=${mysqlConnection.database}`)} ${quoteBash(`--execute=${oldQuery}`)} > ${quoteBash(oldTsvPath)}`,
+        `in_list_${jobIndex}=""`,
+        `if [ -s ${quoteBash(oldTsvPath)} ]; then`,
+        `  in_list_${jobIndex}=$(python3 -c "`,
+        `import sys`,
+        `match_count = ${matchPairs.length}`,
+        `keys = []`,
+        `seen = set()`,
+        `with open('${oldTsvPath}', encoding='utf-8-sig') as f:`,
+        `    for line in f:`,
+        `        parts = line.rstrip('\\r\\n').split('\\t')`,
+        `        if len(parts) > match_count:`,
+        `            vals = [parts[i].strip().strip(\"'\\\"\").replace(\"'\", \"''\") for i in range(1, match_count + 1)]`,
+        `            if all(vals):`,
+        `                k = f\"'{vals[0]}'\" if match_count == 1 else f\"({','.join(f'\\'{v}\\'' for v in vals)})\"`,
+        `                if k not in seen:`,
+        `                    seen.add(k)`,
+        `                    keys.append(k)`,
+        `if 0 < len(keys) <= 50000:`,
+        `    print(','.join(keys))`,
+        `" 2>/dev/null || true)`,
+        `fi`,
+        `if [ -n "$in_list_${jobIndex}" ]; then`,
+        `  pg_query_${jobIndex}="SELECT ${pgColumns.join(", ")} FROM ${quotePgTable(settings.postgresSchema, settings.postgresTable)} WHERE ${matchPairs.length === 1 ? matchWhereCols : `(${matchWhereCols})`} IN ($in_list_${jobIndex});"`,
+        `else`,
+        `  pg_query_${jobIndex}=${quoteBash(pgQuery)}`,
+        `fi`,
+        `PGPASSWORD=${quoteBash(postgresConnection.password)} psql ${quoteBash(`--host=${postgresConnection.host}`)} ${quoteBash(`--port=${postgresConnection.port}`)} ${quoteBash(`--username=${postgresConnection.username}`)} ${quoteBash(`--dbname=${postgresConnection.database}`)} --no-align --tuples-only --field-separator=$'\\t' --command="$pg_query_${jobIndex}" > ${quoteBash(newTsvPath)}`,
+      ];
+
+    const dockerCommands = (isBackfill || isValueMap)
+      ? [
+        `$env:PGPASSWORD = ${quotePowerShell(postgresConnection.password)}`,
+        `docker exec -e PGPASSWORD $postgresClient psql --host=${dockerPostgresConnection.host} --port=${postgresConnection.port} --username=${postgresConnection.username} --dbname=${postgresConnection.database} --no-align --tuples-only --field-separator=$tab --command=${quotePowerShell(pgQuery)} | Out-File ${quotePowerShell(newTsvPath)} -Encoding utf8`,
+        "if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL lookup export failed.' }",
+      ]
+      : [
+        `docker exec -e MYSQL_PWD $mysqlClient mysql --batch --raw --skip-column-names --host=${dockerMysqlHost} --port=${mysqlConnection.port} --user=${mysqlConnection.username} --database=${mysqlConnection.database} --execute=${quotePowerShell(oldQuery)} | Out-File ${quotePowerShell(oldTsvPath)} -Encoding utf8`,
+        "if ($LASTEXITCODE -ne 0) { throw 'MySQL lookup export failed.' }",
+        `$pgLookupQuery_${jobIndex} = ${quotePowerShell(pgQuery)}`,
+        `if (Test-Path ${quotePowerShell(oldTsvPath)}) {`,
+        `  $matchCount_${jobIndex} = ${matchPairs.length}`,
+        `  $oldLines_${jobIndex} = Get-Content ${quotePowerShell(oldTsvPath)} | Where-Object { $_.Trim() -ne '' }`,
+        `  if ($oldLines_${jobIndex}.Count -gt 0 -and $oldLines_${jobIndex}.Count -le 50000) {`,
+        `    if ($matchCount_${jobIndex} -eq 1) {`,
+        `      $keys_${jobIndex} = $oldLines_${jobIndex} | ForEach-Object {`,
+        `        $parts = $_ -split "\`t"`,
+        `        if ($parts.Count -gt 1) {`,
+        `          $k = $parts[1].Trim().Trim("'\`"").Trim()`,
+        `          if ($k -ne '') { "'" + $k.Replace("'", "''") + "'" }`,
+        `        }`,
+        `      } | Select-Object -Unique`,
+        `      if ($keys_${jobIndex}.Count -gt 0) {`,
+        `        $inList_${jobIndex} = $keys_${jobIndex} -join ','`,
+        `        $pgLookupQuery_${jobIndex} = ('SELECT ' + ${quotePowerShell(pgColumns.join(", "))} + ' FROM ' + ${quotePowerShell(quotePgTable(settings.postgresSchema, settings.postgresTable))} + ' WHERE ' + ${quotePowerShell(matchWhereCols)} + ' IN (' + $inList_${jobIndex} + ');')`,
+        `      }`,
+        `    } else {`,
+        `      $tuples_${jobIndex} = $oldLines_${jobIndex} | ForEach-Object {`,
+        `        $parts = $_ -split "\`t"`,
+        `        if ($parts.Count -gt $matchCount_${jobIndex}) {`,
+        `          $vals = for ($i = 1; $i -le $matchCount_${jobIndex}; $i++) {`,
+        `            $k = $parts[$i].Trim().Trim("'\`"").Trim()`,
+        `            "'" + $k.Replace("'", "''") + "'"`,
+        `          }`,
+        `          "(" + ($vals -join ',') + ")"`,
+        `        }`,
+        `      } | Select-Object -Unique`,
+        `      if ($tuples_${jobIndex}.Count -gt 0) {`,
+        `        $inList_${jobIndex} = $tuples_${jobIndex} -join ','`,
+        `        $pgLookupQuery_${jobIndex} = ('SELECT ' + ${quotePowerShell(pgColumns.join(", "))} + ' FROM ' + ${quotePowerShell(quotePgTable(settings.postgresSchema, settings.postgresTable))} + ' WHERE (' + ${quotePowerShell(matchWhereCols)} + ') IN (' + $inList_${jobIndex} + ');')`,
+        `      }`,
+        `    }`,
+        `  }`,
+        `}`,
+        `$env:PGPASSWORD = ${quotePowerShell(postgresConnection.password)}`,
+        `docker exec -e PGPASSWORD $postgresClient psql --host=${dockerPostgresConnection.host} --port=${postgresConnection.port} --username=${postgresConnection.username} --dbname=${postgresConnection.database} --no-align --tuples-only --field-separator=$tab --command=$pgLookupQuery_${jobIndex} | Out-File ${quotePowerShell(newTsvPath)} -Encoding utf8`,
+        "if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL lookup export failed.' }",
+      ];
+
     return {
       source,
       arguments: [
         index,
-        isBackfill ? "-" : isValueMap ? "=" : `pgloader-data/lookup-old-${jobIndex}.tsv`,
-        `pgloader-data/lookup-new-${jobIndex}.tsv`,
+        isBackfill ? "-" : isValueMap ? "=" : oldTsvPath,
+        newTsvPath,
         matchPairs.length,
         sourceIndexes.join(",") || "-",
         settings.caseInsensitive ? 1 : 0,
       ],
-      linuxCommands: [
-        ...((isBackfill || isValueMap) ? [] : [
-          `mysql --batch --raw --skip-column-names ${quoteBash(`--host=${mysqlConnection.host}`)} ${quoteBash(`--port=${mysqlConnection.port}`)} ${quoteBash(`--user=${mysqlConnection.username}`)} ${quoteBash(`--database=${mysqlConnection.database}`)} ${quoteBash(`--execute=${oldQuery}`)} > ${quoteBash(`pgloader-data/lookup-old-${jobIndex}.tsv`)}`,
-        ]),
-        `PGPASSWORD=${quoteBash(postgresConnection.password)} psql ${quoteBash(`--host=${postgresConnection.host}`)} ${quoteBash(`--port=${postgresConnection.port}`)} ${quoteBash(`--username=${postgresConnection.username}`)} ${quoteBash(`--dbname=${postgresConnection.database}`)} --no-align --tuples-only --field-separator=$'\\t' --command=${quoteBash(pgQuery)} > ${quoteBash(`pgloader-data/lookup-new-${jobIndex}.tsv`)}`,
-      ],
-      dockerCommands: [
-        ...((isBackfill || isValueMap) ? [] : [
-          `docker exec -e MYSQL_PWD $mysqlClient mysql --batch --raw --skip-column-names --host=${dockerMysqlHost} --port=${mysqlConnection.port} --user=${mysqlConnection.username} --database=${mysqlConnection.database} --execute=${quotePowerShell(oldQuery)} | Out-File ${quotePowerShell(`pgloader-data/lookup-old-${jobIndex}.tsv`)} -Encoding utf8`,
-          "if ($LASTEXITCODE -ne 0) { throw 'MySQL lookup export failed.' }",
-        ]),
-        `$env:PGPASSWORD = ${quotePowerShell(postgresConnection.password)}`,
-        `docker exec -e PGPASSWORD $postgresClient psql --host=${dockerPostgresConnection.host} --port=${postgresConnection.port} --username=${postgresConnection.username} --dbname=${postgresConnection.database} --no-align --tuples-only --field-separator=$tab --command=${quotePowerShell(pgQuery)} | Out-File ${quotePowerShell(`pgloader-data/lookup-new-${jobIndex}.tsv`)} -Encoding utf8`,
-        "if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL lookup export failed.' }",
-      ],
+      linuxCommands,
+      dockerCommands,
     };
   });
   const linuxLookupCommands = lookupJobDetails.flatMap(({ linuxCommands }) => linuxCommands);

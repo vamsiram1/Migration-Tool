@@ -26,3 +26,9 @@ export const mysqlColumns = (data) =>
 
 export const postgresColumns = (data) =>
     api.post("/postgres/columns", data);
+
+export const mysqlDistinctValues = (data) =>
+    api.post("/mysql/distinct-values", data);
+
+export const postgresMasterRows = (data) =>
+    api.post("/postgres/master-rows", data);

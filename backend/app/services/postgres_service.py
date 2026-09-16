@@ -1,6 +1,10 @@
 import psycopg
 
 
+def quote_identifier(value):
+    return '"' + str(value).replace('"', '""') + '"'
+
+
 def get_connection(data):
     return psycopg.connect(
         host=data.host,
@@ -105,3 +109,39 @@ def get_columns(data, table_name):
         }
         for row in rows
     ]
+
+
+def get_master_table_rows(data, table_name, id_column, display_column, limit=1000):
+    """Return {id, label} rows from a generic master/lookup table, for populating
+    a target-value dropdown during column-value mapping. Any table/column can be
+    used as a master table - nothing here is specific to a particular schema."""
+    conn = get_connection(data)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema=%s AND table_name=%s AND column_name IN (%s, %s)
+    """, (data.schema_name, table_name, id_column, display_column))
+    found = {row[0] for row in cur.fetchall()}
+    if id_column not in found or display_column not in found:
+        cur.close()
+        conn.close()
+        raise ValueError(f"Column(s) not found on '{table_name}'")
+
+    safe_table = quote_identifier(table_name)
+    safe_schema = quote_identifier(data.schema_name)
+    safe_id = quote_identifier(id_column)
+    safe_display = quote_identifier(display_column)
+    safe_limit = int(limit)
+
+    cur.execute(
+        f"SELECT {safe_id}, {safe_display} FROM {safe_schema}.{safe_table} "
+        f"ORDER BY {safe_display} LIMIT {safe_limit}"
+    )
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return [{"id": row[0], "label": row[1]} for row in rows]

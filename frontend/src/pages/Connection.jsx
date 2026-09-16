@@ -710,6 +710,7 @@ export default function Connection() {
 
           {selectedTable && !columnLoading && (
             <ColumnMapping
+              selectedTable={selectedTable}
               mysqlColumns={columns.mysql}
               postgresColumns={columns.postgres}
               mappings={columnMappings[selectedTable] || {}}

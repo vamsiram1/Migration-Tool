@@ -8,6 +8,8 @@ from app.services.mysql_service import get_schemas
 
 from app.schemas.table_request import TableRequest
 from app.services.mysql_service import get_columns
+from app.schemas.value_mapping import ColumnValuesRequest
+from app.services.mysql_service import get_distinct_values
 
 router = APIRouter(prefix="/mysql", tags=["MySQL"])
 
@@ -50,5 +52,13 @@ def mysql_tables(conn: SchemaRequest):
 def mysql_columns(req: TableRequest):
     try:
         return get_columns(req, req.table_name)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/distinct-values")
+def mysql_distinct_values(req: ColumnValuesRequest):
+    try:
+        return get_distinct_values(req, req.table_name, req.column_name, req.limit)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

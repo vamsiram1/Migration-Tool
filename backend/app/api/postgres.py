@@ -8,6 +8,8 @@ from app.services.postgres_service import get_schemas
 from app.services.postgres_service import get_databases
 from app.schemas.table_request import TableRequest
 from app.services.postgres_service import get_columns
+from app.schemas.value_mapping import MasterTableRequest
+from app.services.postgres_service import get_master_table_rows
 
 router = APIRouter(prefix="/postgres", tags=["PostgreSQL"])
 
@@ -59,6 +61,14 @@ def postgres_tables(conn: SchemaRequest):
 def postgres_columns(req: TableRequest):
     try:
         return get_columns(req, req.table_name)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/master-rows")
+def postgres_master_rows(req: MasterTableRequest):
+    try:
+        return get_master_table_rows(req, req.table_name, req.id_column, req.display_column, req.limit)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

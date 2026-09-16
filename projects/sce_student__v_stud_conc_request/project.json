@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "mysqlConnection": {
+    "host": "192.168.20.9",
+    "port": 3306,
+    "database": "esaplive",
+    "username": "vamsi",
+    "password": "Vamsi@123"
+  },
+  "postgresConnection": {
+    "host": "192.168.20.220",
+    "port": 5432,
+    "database": "sce_prod",
+    "username": "postgres",
+    "password": "Welcome123"
+  },
+  "selectedSchemas": {
+    "mysql": "esaplive",
+    "postgres": "sce_student"
+  },
+  "migration": {
+    "mysqlTables": [
+      {
+        "table_name": "t_concession_processing"
+      }
+    ],
+    "postgresTables": [
+      {
+        "table_name": "v_stud_conc_request"
+      }
+    ]
+  },
+  "tableMappings": {
+    "t_concession_processing": {
+      "selected": true,
+      "destination": "v_stud_conc_request"
+    }
+  },
+  "columnMappings": {
+    "t_concession_processing": {
+      "ADM_NO": {
+        "selected": true,
+        "destination": "stud_adms_id",
+        "lookup": {
+          "mode": "crosswalk",
+          "mysqlSchema": "esaplive",
+          "mysqlTable": "t_student",
+          "mysqlIdColumn": "ADM_NO",
+          "mysqlMatchColumn": "ADM_NO",
+          "postgresSchema": "sce_student",
+          "postgresTable": "sce_stud_acdc_detl",
+          "postgresMatchColumn": "stud_adms_no",
+          "postgresResultColumn": "stud_adms_id"
+        }
+      },
+      "CONCESSION_REASON_ID": {
+        "selected": true,
+        "destination": "conc_reason_id"
+      },
+      "REQUEST_AMOUNT": {
+        "selected": true,
+        "destination": "requested_conc"
+      },
+      "APPROVED_AMOUNT": {
+        "selected": true,
+        "destination": "approved_conc"
+      },
+      "APPROVED_EMP_ID": {
+        "selected": true,
+        "destination": "approved_by"
+      },
+      "APPROVED_DATE": {
+        "selected": true,
+        "destination": "approved_date"
+      },
+      "CREATED_BY": {
+        "selected": true,
+        "destination": "created_by"
+      },
+      "CREATED_ON": {
+        "selected": true,
+        "destination": "created_date"
+      },
+      "MODIFIED_BY": {
+        "selected": true,
+        "destination": "updated_by"
+      },
+      "MODIFIED_ON": {
+        "selected": true,
+        "destination": "updated_date"
+      },
+      "STATUS": {
+        "selected": true,
+        "destination": "approval_status_id",
+        "defaultValue": "12",
+        "replacements": [
+          {
+            "from": "CONFIRM",
+            "to": "1"
+          },
+          {
+            "from": "APPROVED",
+            "to": "1"
+          },
+          {
+            "from": "MANUAL_CONFIRM",
+            "to": "1"
+          },
+          {
+            "from": "APPROVED-APK",
+            "to": "1"
+          },
+          {
+            "from": "CONFIRMED",
+            "to": "1"
+          },
+          {
+            "from": "REJECTED",
+            "to": "5"
+          },
+          {
+            "from": "REJECTED-APK",
+            "to": "5"
+          },
+          {
+            "from": "REJECT",
+            "to": "5"
+          },
+          {
+            "from": "REJECTD",
+            "to": "5"
+          },
+          {
+            "from": "REQUEST",
+            "to": "4"
+          },
+          {
+            "from": "REQUEST-APK",
+            "to": "4"
+          },
+          {
+            "from": "REQUEST_JUL",
+            "to": "4"
+          },
+          {
+            "from": "REQ_A_MAR",
+            "to": "4"
+          },
+          {
+            "from": "REQ_A_27_NOV_2019",
+            "to": "4"
+          }
+        ]
+      },
+      "__postgresDefaults": [
+        {
+          "destination": "is_active",
+          "value": "1"
+        },
+        {
+          "destination": "conc_type_id",
+          "value": "1"
+        }
+      ]
+    }
+  }
+}
