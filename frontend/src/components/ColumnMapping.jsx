@@ -1,4 +1,5 @@
 import {
+  Alert,
   Card,
   CardContent,
   Typography,
@@ -22,10 +23,12 @@ import {
   Chip,
   IconButton,
   FormControlLabel,
+  Switch,
   Dialog,
   DialogTitle,
   DialogContent,
   DialogActions,
+  Grid,
 } from "@mui/material";
 import {
   Add as AddIcon,
@@ -33,6 +36,10 @@ import {
   SwapHoriz as SwapHorizIcon,
   Close as CloseIcon,
   Tune as SettingsIcon,
+  CalendarToday as CalendarTodayIcon,
+  FilterAlt as FilterAltIcon,
+  RestartAlt as RestartAltIcon,
+  Link as LinkIcon,
 } from "@mui/icons-material";
 import { useState, useEffect } from "react";
 import {
@@ -66,6 +73,8 @@ export default function ColumnMapping({
   const [masterTableTables, setMasterTableTables] = useState({});
   const [masterRowOptions, setMasterRowOptions] = useState({});
   const [distinctValuesLoading, setDistinctValuesLoading] = useState({});
+  const [relatedTableColumns, setRelatedTableColumns] = useState({});
+  const [loadingRelatedCols, setLoadingRelatedCols] = useState(false);
 
   useEffect(() => {
     const preloadLookupOptions = async () => {
@@ -185,6 +194,30 @@ export default function ColumnMapping({
         .catch((e) => console.error("Failed to preload relation lookup columns", e));
     }
   }, [mappings, selectedSchemas.postgres, postgresConnection]);
+
+  useEffect(() => {
+    const relTable = mappings.__relatedTableFilter?.relatedTable;
+    if (relTable && !relatedTableColumns[relTable]) {
+      setLoadingRelatedCols(true);
+      loadMysqlColumns({
+        ...mysqlConnection,
+        schema_name: selectedSchemas.mysql,
+        table_name: relTable,
+      })
+        .then((res) => {
+          setRelatedTableColumns((prev) => ({
+            ...prev,
+            [relTable]: res.data,
+          }));
+        })
+        .catch((err) => {
+          console.error("Failed to load related table columns:", err);
+        })
+        .finally(() => {
+          setLoadingRelatedCols(false);
+        });
+    }
+  }, [mappings.__relatedTableFilter?.relatedTable, selectedSchemas.mysql, mysqlConnection]);
 
   useEffect(() => {
     const preloadMasterTableTables = async () => {
@@ -935,6 +968,115 @@ export default function ColumnMapping({
     mappings.__relationRows?.relationIdColumn,
   ].filter(Boolean));
 
+  const DATE_TYPES = new Set(["date", "datetime", "timestamp"]);
+  const dateColumns = (mysqlColumns || []).filter((col) =>
+    DATE_TYPES.has(String(col.data_type || "").toLowerCase())
+  );
+
+  const dateFilter = mappings.__dateFilter || { column: "", fromDate: "", toDate: "" };
+
+  const updateDateFilter = (field, value) => {
+    setMappings((previous) => {
+      const current = previous.__dateFilter || { column: "", fromDate: "", toDate: "" };
+      const next = { ...current, [field]: value };
+      if (field === "column" && !value) {
+        next.fromDate = "";
+        next.toDate = "";
+      }
+      return {
+        ...previous,
+        __dateFilter: next,
+      };
+    });
+  };
+
+  const clearDateFilter = () => {
+    setMappings((previous) => ({
+      ...previous,
+      __dateFilter: { column: "", fromDate: "", toDate: "" },
+    }));
+  };
+
+  const relatedTableFilter = mappings.__relatedTableFilter || {
+    sourceJoinColumn: "",
+    relatedTable: "",
+    relatedJoinColumn: "",
+    conditionColumn: "",
+    operator: ">",
+    conditionValue: "",
+    limitEnabled: false,
+    limitRows: 2000,
+  };
+
+  const updateRelatedTableFilter = async (field, value) => {
+    setMappings((previous) => {
+      const current = previous.__relatedTableFilter || {
+        sourceJoinColumn: "",
+        relatedTable: "",
+        relatedJoinColumn: "",
+        conditionColumn: "",
+        operator: ">",
+        conditionValue: "",
+        limitEnabled: false,
+        limitRows: 2000,
+      };
+      const next = { ...current, [field]: value };
+      if (field === "relatedTable") {
+        next.relatedJoinColumn = "";
+        next.conditionColumn = "";
+      }
+      return {
+        ...previous,
+        __relatedTableFilter: next,
+      };
+    });
+
+    if (field === "relatedTable" && value && !relatedTableColumns[value]) {
+      try {
+        setLoadingRelatedCols(true);
+        const res = await loadMysqlColumns({
+          ...mysqlConnection,
+          schema_name: selectedSchemas.mysql,
+          table_name: value,
+        });
+        setRelatedTableColumns((prev) => ({
+          ...prev,
+          [value]: res.data,
+        }));
+      } catch (err) {
+        console.error("Failed to load related table columns:", err);
+      } finally {
+        setLoadingRelatedCols(false);
+      }
+    }
+  };
+
+  const clearRelatedTableFilter = () => {
+    setMappings((previous) => ({
+      ...previous,
+      __relatedTableFilter: {
+        sourceJoinColumn: "",
+        relatedTable: "",
+        relatedJoinColumn: "",
+        conditionColumn: "",
+        operator: ">",
+        conditionValue: "",
+        limitEnabled: false,
+        limitRows: 2000,
+      },
+    }));
+  };
+
+  const isRelFilterActive = Boolean(
+    relatedTableFilter.relatedTable &&
+    relatedTableFilter.sourceJoinColumn &&
+    relatedTableFilter.relatedJoinColumn &&
+    relatedTableFilter.conditionColumn &&
+    (relatedTableFilter.operator?.includes("NULL") ||
+      (relatedTableFilter.conditionValue !== "" &&
+        relatedTableFilter.conditionValue !== undefined))
+  );
+
   return (
     <Card sx={{ mt: 3 }}>
       <CardContent>
@@ -942,6 +1084,427 @@ export default function ColumnMapping({
         <Typography variant="h5" gutterBottom>
           Column Mapping
         </Typography>
+
+        <Paper
+          variant="outlined"
+          sx={{
+            p: 2.5,
+            mb: 3,
+            borderRadius: 2,
+            bgcolor: (theme) =>
+              theme.palette.mode === "dark"
+                ? "rgba(33, 150, 243, 0.06)"
+                : "rgba(33, 150, 243, 0.04)",
+            borderColor: (theme) =>
+              dateFilter.column && dateFilter.fromDate && dateFilter.toDate
+                ? "primary.main"
+                : "divider",
+          }}
+        >
+          <Stack spacing={2}>
+            <Stack direction="row" spacing={1.5} alignItems="center" justifyContent="space-between" flexWrap="wrap">
+              <Stack direction="row" spacing={1} alignItems="center">
+                <CalendarTodayIcon color="primary" fontSize="small" />
+                <Typography variant="h6" sx={{ fontSize: "1.05rem", fontWeight: 600 }}>
+                  Date Range Filter (Optional)
+                </Typography>
+              </Stack>
+              {dateFilter.column && (
+                <Chip
+                  icon={<FilterAltIcon />}
+                  label={
+                    dateFilter.fromDate && dateFilter.toDate && dateFilter.fromDate <= dateFilter.toDate
+                      ? `Filter Active: ${dateFilter.column} (${dateFilter.fromDate} to ${dateFilter.toDate})`
+                      : `Filtering by: ${dateFilter.column}`
+                  }
+                  color={
+                    dateFilter.fromDate && dateFilter.toDate && dateFilter.fromDate <= dateFilter.toDate
+                      ? "primary"
+                      : "warning"
+                  }
+                  size="small"
+                  variant="filled"
+                  sx={{ fontWeight: 600 }}
+                />
+              )}
+            </Stack>
+
+            <Typography variant="body2" color="text.secondary">
+              Filter source records from <strong>{selectedTable}</strong> by date/time before migration. Records on the end date are included in full.
+            </Typography>
+
+            {dateColumns.length === 0 ? (
+              <Alert severity="info" sx={{ mt: 1 }}>
+                No DATE, DATETIME, or TIMESTAMP columns found in <strong>{selectedTable}</strong>. Full table migration will be performed.
+              </Alert>
+            ) : (
+              <>
+                <Grid container spacing={2} alignItems="center">
+                  <Grid size={{ xs: 12, md: dateFilter.column ? 4 : 6 }}>
+                    <FormControl fullWidth size="small">
+                      <InputLabel id="date-column-select-label">Select Date Column</InputLabel>
+                      <Select
+                        labelId="date-column-select-label"
+                        label="Select Date Column"
+                        value={dateFilter.column || ""}
+                        onChange={(e) => updateDateFilter("column", e.target.value)}
+                      >
+                        <MenuItem value="">
+                          <em>-- No Date Filter (All records) --</em>
+                        </MenuItem>
+                        {dateColumns.map((col) => (
+                          <MenuItem key={col.column_name} value={col.column_name}>
+                            {col.column_name} ({col.data_type})
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                  </Grid>
+
+                  {dateFilter.column && (
+                    <>
+                      <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+                        <TextField
+                          label="From Date"
+                          type="date"
+                          size="small"
+                          fullWidth
+                          value={dateFilter.fromDate || ""}
+                          onChange={(e) => updateDateFilter("fromDate", e.target.value)}
+                          slotProps={{ inputLabel: { shrink: true } }}
+                          InputLabelProps={{ shrink: true }}
+                        />
+                      </Grid>
+
+                      <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+                        <TextField
+                          label="To Date"
+                          type="date"
+                          size="small"
+                          fullWidth
+                          value={dateFilter.toDate || ""}
+                          onChange={(e) => updateDateFilter("toDate", e.target.value)}
+                          slotProps={{ inputLabel: { shrink: true } }}
+                          InputLabelProps={{ shrink: true }}
+                        />
+                      </Grid>
+
+                      <Grid size={{ xs: 12, md: 2 }}>
+                        <Button
+                          variant="outlined"
+                          color="inherit"
+                          size="small"
+                          startIcon={<RestartAltIcon />}
+                          onClick={clearDateFilter}
+                          fullWidth
+                          sx={{ textTransform: "none", py: 0.8 }}
+                        >
+                          Clear
+                        </Button>
+                      </Grid>
+                    </>
+                  )}
+                </Grid>
+
+                {dateFilter.column && (
+                  <Box>
+                    {dateFilter.fromDate && dateFilter.toDate ? (
+                      dateFilter.fromDate > dateFilter.toDate ? (
+                        <Alert severity="error" sx={{ mt: 1 }}>
+                          From Date (<strong>{dateFilter.fromDate}</strong>) cannot be greater than To Date (<strong>{dateFilter.toDate}</strong>). Please correct the date range.
+                        </Alert>
+                      ) : (
+                        <Alert severity="success" sx={{ mt: 1 }}>
+                          Records will be filtered where <strong>{dateFilter.column}</strong> is between <strong>{dateFilter.fromDate}</strong> and <strong>{dateFilter.toDate}</strong> (inclusive of entire day).
+                        </Alert>
+                      )
+                    ) : dateFilter.fromDate && !dateFilter.toDate ? (
+                      <Alert severity="warning" sx={{ mt: 1 }}>
+                        Please select a <strong>To Date</strong> to complete the filter range.
+                      </Alert>
+                    ) : !dateFilter.fromDate && dateFilter.toDate ? (
+                      <Alert severity="warning" sx={{ mt: 1 }}>
+                        Please select a <strong>From Date</strong> to complete the filter range.
+                      </Alert>
+                    ) : (
+                      <Alert severity="info" sx={{ mt: 1 }}>
+                        Please select the <strong>From Date</strong> and <strong>To Date</strong> range for filtering.
+                      </Alert>
+                    )}
+                  </Box>
+                )}
+              </>
+            )}
+          </Stack>
+        </Paper>
+
+        <Paper
+          variant="outlined"
+          sx={{
+            p: 2.5,
+            mb: 3,
+            borderRadius: 2,
+            bgcolor: (theme) =>
+              theme.palette.mode === "dark"
+                ? "rgba(156, 39, 176, 0.06)"
+                : "rgba(156, 39, 176, 0.04)",
+            borderColor: isRelFilterActive
+              ? "secondary.main"
+              : "divider",
+          }}
+        >
+          <Stack spacing={2}>
+            <Stack direction="row" spacing={1.5} alignItems="center" justifyContent="space-between" flexWrap="wrap">
+              <Stack direction="row" spacing={1} alignItems="center">
+                <LinkIcon color="secondary" fontSize="small" />
+                <Typography variant="h6" sx={{ fontSize: "1.05rem", fontWeight: 600 }}>
+                  Related Table Filter (Optional)
+                </Typography>
+              </Stack>
+              {relatedTableFilter.relatedTable && (
+                <Chip
+                  icon={<FilterAltIcon />}
+                  label={
+                    isRelFilterActive
+                      ? `Filter Active: ${relatedTableFilter.relatedTable}.${relatedTableFilter.conditionColumn} ${relatedTableFilter.operator} ${
+                          relatedTableFilter.operator?.includes("NULL")
+                            ? ""
+                            : relatedTableFilter.conditionValue
+                        }${relatedTableFilter.limitEnabled && Number(relatedTableFilter.limitRows) > 0 ? ` (Limit: ${Number(relatedTableFilter.limitRows).toLocaleString()})` : ""}`
+                      : `Filtering via: ${relatedTableFilter.relatedTable}`
+                  }
+                  color={isRelFilterActive ? "secondary" : "warning"}
+                  size="small"
+                  variant="filled"
+                  sx={{ fontWeight: 600 }}
+                />
+              )}
+            </Stack>
+
+            <Typography variant="body2" color="text.secondary">
+              Filter source records from <strong>{selectedTable}</strong> based on matching conditions in a related MySQL table.
+            </Typography>
+
+            <Grid container spacing={2} alignItems="center">
+              <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+                <FormControl fullWidth size="small">
+                  <InputLabel id="rel-filter-source-join-col-label">Main Join Column</InputLabel>
+                  <Select
+                    labelId="rel-filter-source-join-col-label"
+                    label="Main Join Column"
+                    value={relatedTableFilter.sourceJoinColumn || ""}
+                    onChange={(e) => updateRelatedTableFilter("sourceJoinColumn", e.target.value)}
+                  >
+                    <MenuItem value="">
+                      <em>-- Select Column ({selectedTable}) --</em>
+                    </MenuItem>
+                    {(mysqlColumns || []).map((col) => (
+                      <MenuItem key={col.column_name} value={col.column_name}>
+                        {col.column_name}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              </Grid>
+
+              <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+                <FormControl fullWidth size="small">
+                  <InputLabel id="rel-filter-table-label">Related Table</InputLabel>
+                  <Select
+                    labelId="rel-filter-table-label"
+                    label="Related Table"
+                    value={relatedTableFilter.relatedTable || ""}
+                    onChange={(e) => updateRelatedTableFilter("relatedTable", e.target.value)}
+                  >
+                    <MenuItem value="">
+                      <em>-- No Related Filter --</em>
+                    </MenuItem>
+                    {(mysqlTables || [])
+                      .filter((t) => t.table_name !== selectedTable)
+                      .map((table) => (
+                        <MenuItem key={table.table_name} value={table.table_name}>
+                          {table.table_name}
+                        </MenuItem>
+                      ))}
+                  </Select>
+                </FormControl>
+              </Grid>
+
+              {relatedTableFilter.relatedTable && (
+                <>
+                  <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+                    <FormControl fullWidth size="small">
+                      <InputLabel id="rel-filter-related-join-col-label">Related Join Column</InputLabel>
+                      <Select
+                        labelId="rel-filter-related-join-col-label"
+                        label="Related Join Column"
+                        value={relatedTableFilter.relatedJoinColumn || ""}
+                        onChange={(e) => updateRelatedTableFilter("relatedJoinColumn", e.target.value)}
+                        disabled={loadingRelatedCols}
+                      >
+                        <MenuItem value="">
+                          <em>-- Select Column ({relatedTableFilter.relatedTable}) --</em>
+                        </MenuItem>
+                        {(relatedTableColumns[relatedTableFilter.relatedTable] || []).map((col) => (
+                          <MenuItem key={col.column_name} value={col.column_name}>
+                            {col.column_name}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                  </Grid>
+
+                  <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+                    <FormControl fullWidth size="small">
+                      <InputLabel id="rel-filter-condition-col-label">Condition Column</InputLabel>
+                      <Select
+                        labelId="rel-filter-condition-col-label"
+                        label="Condition Column"
+                        value={relatedTableFilter.conditionColumn || ""}
+                        onChange={(e) => updateRelatedTableFilter("conditionColumn", e.target.value)}
+                        disabled={loadingRelatedCols}
+                      >
+                        <MenuItem value="">
+                          <em>-- Select Condition Column --</em>
+                        </MenuItem>
+                        {(relatedTableColumns[relatedTableFilter.relatedTable] || []).map((col) => (
+                          <MenuItem key={col.column_name} value={col.column_name}>
+                            {col.column_name}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                  </Grid>
+
+                  <Grid size={{ xs: 12, sm: 4, md: 2 }}>
+                    <FormControl fullWidth size="small">
+                      <InputLabel id="rel-filter-operator-label">Operator</InputLabel>
+                      <Select
+                        labelId="rel-filter-operator-label"
+                        label="Operator"
+                        value={relatedTableFilter.operator || ">"}
+                        onChange={(e) => updateRelatedTableFilter("operator", e.target.value)}
+                      >
+                        <MenuItem value=">">&gt; (Greater than)</MenuItem>
+                        <MenuItem value=">=">&gt;= (Greater or equal)</MenuItem>
+                        <MenuItem value="<">&lt; (Less than)</MenuItem>
+                        <MenuItem value="<=">&lt;= (Less or equal)</MenuItem>
+                        <MenuItem value="=">= (Equals)</MenuItem>
+                        <MenuItem value="!=">!= (Not equals)</MenuItem>
+                        <MenuItem value="LIKE">LIKE</MenuItem>
+                        <MenuItem value="NOT LIKE">NOT LIKE</MenuItem>
+                        <MenuItem value="IS NOT NULL">IS NOT NULL</MenuItem>
+                        <MenuItem value="IS NULL">IS NULL</MenuItem>
+                      </Select>
+                    </FormControl>
+                  </Grid>
+
+                  {!relatedTableFilter.operator?.includes("NULL") && (
+                    <Grid size={{ xs: 12, sm: 5, md: 3 }}>
+                      <TextField
+                        label="Condition Value"
+                        size="small"
+                        fullWidth
+                        value={relatedTableFilter.conditionValue ?? ""}
+                        onChange={(e) => updateRelatedTableFilter("conditionValue", e.target.value)}
+                        placeholder="e.g. 0 or ACTIVE"
+                      />
+                    </Grid>
+                  )}
+
+                  <Grid size={{ xs: 12, sm: 3, md: 2 }}>
+                    <Button
+                      variant="outlined"
+                      color="inherit"
+                      size="small"
+                      startIcon={<RestartAltIcon />}
+                      onClick={clearRelatedTableFilter}
+                      fullWidth
+                      sx={{ textTransform: "none", py: 0.8 }}
+                    >
+                      Clear
+                    </Button>
+                  </Grid>
+
+                  <Grid size={{ xs: 12 }}>
+                    <Divider sx={{ my: 0.5 }} />
+                  </Grid>
+
+                  <Grid size={{ xs: 12, sm: 6, md: 4 }}>
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={Boolean(relatedTableFilter.limitEnabled)}
+                          onChange={(e) => updateRelatedTableFilter("limitEnabled", e.target.checked)}
+                          color="secondary"
+                          size="small"
+                        />
+                      }
+                      label={
+                        <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                          Limit Related Table Records
+                        </Typography>
+                      }
+                    />
+                  </Grid>
+
+                  {relatedTableFilter.limitEnabled && (
+                    <Grid size={{ xs: 12, sm: 6, md: 4 }}>
+                      <TextField
+                        label="Related Record Limit"
+                        type="number"
+                        size="small"
+                        fullWidth
+                        value={relatedTableFilter.limitRows ?? 2000}
+                        onChange={(e) => {
+                          const val = e.target.value === "" ? "" : Math.max(1, parseInt(e.target.value) || 0);
+                          updateRelatedTableFilter("limitRows", val);
+                        }}
+                        placeholder="2000"
+                        helperText="Limits only records matched via this related condition"
+                      />
+                    </Grid>
+                  )}
+                </>
+              )}
+            </Grid>
+
+            {relatedTableFilter.relatedTable && (
+              <Box>
+                {isRelFilterActive ? (
+                  <Alert severity="success" sx={{ mt: 1 }}>
+                    Records will be filtered where <strong>{selectedTable}.{relatedTableFilter.sourceJoinColumn}</strong> matches{" "}
+                    <strong>{relatedTableFilter.relatedTable}.{relatedTableFilter.relatedJoinColumn}</strong> and{" "}
+                    <strong>
+                      {relatedTableFilter.relatedTable}.{relatedTableFilter.conditionColumn}{" "}
+                      {relatedTableFilter.operator}{" "}
+                      {relatedTableFilter.operator?.includes("NULL") ? "" : relatedTableFilter.conditionValue}
+                    </strong>
+                    {relatedTableFilter.limitEnabled && Number(relatedTableFilter.limitRows) > 0 && (
+                      <span> (limited to <strong>{Number(relatedTableFilter.limitRows).toLocaleString()}</strong> related records)</span>
+                    )}.
+                  </Alert>
+                ) : !relatedTableFilter.sourceJoinColumn ? (
+                  <Alert severity="warning" sx={{ mt: 1 }}>
+                    Please select the <strong>Main Join Column</strong> in <strong>{selectedTable}</strong>.
+                  </Alert>
+                ) : !relatedTableFilter.relatedJoinColumn ? (
+                  <Alert severity="warning" sx={{ mt: 1 }}>
+                    Please select the <strong>Related Join Column</strong> in <strong>{relatedTableFilter.relatedTable}</strong>.
+                  </Alert>
+                ) : !relatedTableFilter.conditionColumn ? (
+                  <Alert severity="warning" sx={{ mt: 1 }}>
+                    Please select the <strong>Condition Column</strong> to evaluate.
+                  </Alert>
+                ) : (
+                  <Alert severity="warning" sx={{ mt: 1 }}>
+                    Please enter the <strong>Condition Value</strong>.
+                  </Alert>
+                )}
+              </Box>
+            )}
+          </Stack>
+        </Paper>
 
         <TableContainer>
 

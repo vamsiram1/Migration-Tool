@@ -5,6 +5,7 @@ import {
   Card,
   CardContent,
   Checkbox,
+  Chip,
   FormControl,
   InputLabel,
   MenuItem,
@@ -26,6 +27,7 @@ export default function TableList({
   setMappings,
   selectedTable,
   onSelectTable,
+  columnMappings = {},
 }) {
   const [sourceTable, setSourceTable] = useState("");
   const [destinationTable, setDestinationTable] = useState("");
@@ -134,31 +136,67 @@ export default function TableList({
                 </TableRow>
               </TableHead>
               <TableBody>
-                {Object.entries(mappings).map(([source, mapping]) => (
-                  <TableRow key={source}>
-                    <TableCell>
-                      <Checkbox
-                        checked={mapping.selected}
-                        onChange={(event) => updateMapping(source, "selected", event.target.checked)}
-                      />
-                    </TableCell>
-                    <TableCell>{source}</TableCell>
-                    <TableCell>{mapping.destination}</TableCell>
-                    <TableCell>
-                      <Button
-                        size="small"
-                        onClick={() => onSelectTable(source)}
-                        disabled={!mapping.selected}
-                        variant={selectedTable === source ? "contained" : "outlined"}
-                      >
-                        {selectedTable === source ? "Mapping" : "Map columns"}
-                      </Button>
-                    </TableCell>
-                    <TableCell>
-                      <Button color="error" onClick={() => removeMapping(source)}>Remove</Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {Object.entries(mappings).map(([source, mapping]) => {
+                  const filter = columnMappings[source]?.__dateFilter;
+                  const hasActiveFilter = Boolean(filter?.column && filter?.fromDate && filter?.toDate && filter.fromDate <= filter.toDate);
+
+                  const relFilter = columnMappings[source]?.__relatedTableFilter;
+                  const hasActiveRelFilter = Boolean(
+                    relFilter?.relatedTable &&
+                    relFilter?.sourceJoinColumn &&
+                    relFilter?.relatedJoinColumn &&
+                    relFilter?.conditionColumn &&
+                    (relFilter.operator?.includes("NULL") || (relFilter.conditionValue !== "" && relFilter.conditionValue !== undefined))
+                  );
+
+                  return (
+                    <TableRow key={source}>
+                      <TableCell>
+                        <Checkbox
+                          checked={mapping.selected}
+                          onChange={(event) => updateMapping(source, "selected", event.target.checked)}
+                        />
+                      </TableCell>
+                      <TableCell>
+                        <Stack spacing={0.5} alignItems="flex-start">
+                          <Typography variant="body2" fontWeight={500}>{source}</Typography>
+                          {hasActiveFilter && (
+                            <Chip
+                              label={`📅 ${filter.column}: ${filter.fromDate} to ${filter.toDate}`}
+                              size="small"
+                              color="primary"
+                              variant="outlined"
+                              sx={{ fontSize: "0.72rem", height: "20px" }}
+                            />
+                          )}
+                          {hasActiveRelFilter && (
+                            <Chip
+                              label={`🔗 ${relFilter.relatedTable}.${relFilter.conditionColumn} ${relFilter.operator} ${relFilter.operator?.includes("NULL") ? "" : relFilter.conditionValue}${relFilter.limitEnabled && Number(relFilter.limitRows) > 0 ? ` [Limit: ${Number(relFilter.limitRows).toLocaleString()}]` : ""}`}
+                              size="small"
+                              color="secondary"
+                              variant="outlined"
+                              sx={{ fontSize: "0.72rem", height: "20px" }}
+                            />
+                          )}
+                        </Stack>
+                      </TableCell>
+                      <TableCell>{mapping.destination}</TableCell>
+                      <TableCell>
+                        <Button
+                          size="small"
+                          onClick={() => onSelectTable(source)}
+                          disabled={!mapping.selected}
+                          variant={selectedTable === source ? "contained" : "outlined"}
+                        >
+                          {selectedTable === source ? "Mapping" : "Map columns"}
+                        </Button>
+                      </TableCell>
+                      <TableCell>
+                        <Button color="error" onClick={() => removeMapping(source)}>Remove</Button>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           </TableContainer>

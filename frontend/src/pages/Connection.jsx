@@ -104,6 +104,7 @@ export default function Connection() {
   const [cancelling, setCancelling] = useState(false);
   const [activeTab, setActiveTab] = useState(0);
   const [limitRecords, setLimitRecords] = useState(false);
+  const [sampleLimitRows, setSampleLimitRows] = useState(2000);
   const projectFileInput = useRef(null);
 
   const pgloaderFiles = generatePgloaderConfig({
@@ -112,7 +113,7 @@ export default function Connection() {
     tableMappings,
     columnMappings,
     selectedSchemas,
-    limitRows: limitRecords ? 1000 : null,
+    limitRows: limitRecords ? (Number(sampleLimitRows) || 2000) : null,
   });
 
   // -------------------------------
@@ -249,6 +250,16 @@ export default function Connection() {
     } catch {
       setCopyMessage("Could not copy automatically. Select the config text and copy it manually.");
     }
+  };
+
+  const downloadStandaloneLinuxScript = () => {
+    const file = new Blob([pgloaderFiles.standaloneLinuxScript], { type: "text/x-sh;charset=utf-8" });
+    const url = URL.createObjectURL(file);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "run-migration-linux.sh";
+    link.click();
+    URL.revokeObjectURL(url);
   };
 
   const downloadConfig = () => {
@@ -702,6 +713,7 @@ export default function Connection() {
               setMappings={setTableMappings}
               selectedTable={selectedTable}
               onSelectTable={loadColumns}
+              columnMappings={columnMappings}
             />
 
           )}
@@ -742,10 +754,8 @@ export default function Connection() {
               {pgloaderFiles.config ? (
                 <Stack spacing={2}>
                   <Alert severity="info">
-                    Download both files into the same folder, open a terminal there, and run
-                    <code>chmod +x mysql-to-pgloader.sh &amp;&amp; ./mysql-to-pgloader.sh</code>. The script exports
-                    only the selected fields and runs the native Linux pgloader command. Existing destination tables are
-                    preserved; pgloader inserts into the columns you mapped.
+                    For a single-file run on Linux (e.g. via MobaXterm), click <b>Download All-in-One Linux Script (.sh)</b>, copy <code>run-migration-linux.sh</code> to Linux, and run <code>chmod +x run-migration-linux.sh &amp;&amp; ./run-migration-linux.sh</code>.
+                    Alternatively, you can download the separate <code>.load</code> file and export script into the same folder.
                   </Alert>
 
                   <TextField
@@ -757,7 +767,10 @@ export default function Connection() {
                     InputProps={{ readOnly: true }}
                   />
 
-                  <Stack direction="row" spacing={2}>
+                  <Stack direction="row" spacing={2} flexWrap="wrap">
+                    <Button variant="contained" color="success" onClick={downloadStandaloneLinuxScript}>
+                      Download All-in-One Linux Script (.sh)
+                    </Button>
                     <Button variant="contained" onClick={downloadConfig}>Download .load file</Button>
                     <Button variant="contained" onClick={downloadExportScript}>Download export script</Button>
                     <Button variant="outlined" onClick={downloadLookupHelper}>Download lookup helper</Button>
@@ -779,7 +792,7 @@ export default function Connection() {
           </Alert>
 
           <Box sx={{ p: 2, mb: 2, bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(255,255,255,0.05)' : '#f8f9fa', borderRadius: 2, border: '1px solid', borderColor: 'divider' }}>
-            <Stack direction="row" spacing={2} alignItems="center" justifyContent="space-between">
+            <Stack direction="row" spacing={2} alignItems="center" justifyContent="space-between" flexWrap="wrap">
               <FormControlLabel
                 control={
                   <Switch
@@ -790,23 +803,33 @@ export default function Connection() {
                 }
                 label={
                   <Typography variant="body1" fontWeight={600}>
-                    Sample Dump Mode (Limit to 1,000 records)
+                    Sample Dump Mode
                   </Typography>
                 }
               />
               {limitRecords && (
-                <Chip
-                  label="1,000 Records Limit Active"
-                  color="warning"
-                  size="small"
-                  variant="filled"
-                  sx={{ fontWeight: 600 }}
-                />
+                <Stack direction="row" spacing={1.5} alignItems="center">
+                  <TextField
+                    label="Limit Rows"
+                    type="number"
+                    size="small"
+                    value={sampleLimitRows}
+                    onChange={(e) => setSampleLimitRows(e.target.value === "" ? "" : Math.max(1, parseInt(e.target.value) || 0))}
+                    sx={{ width: 140 }}
+                  />
+                  <Chip
+                    label={`${Number(sampleLimitRows || 2000).toLocaleString()} Records Limit Active`}
+                    color="warning"
+                    size="small"
+                    variant="filled"
+                    sx={{ fontWeight: 600 }}
+                  />
+                </Stack>
               )}
             </Stack>
             <Typography variant="caption" color="text.secondary">
               {limitRecords
-                ? "Fast testing mode enabled. Only the first 1,000 rows will be exported from each MySQL table."
+                ? `Fast testing mode enabled. Only up to ${Number(sampleLimitRows || 2000).toLocaleString()} rows will be exported from each MySQL table.`
                 : "Full dump mode. All records from the selected tables will be migrated."}
             </Typography>
           </Box>

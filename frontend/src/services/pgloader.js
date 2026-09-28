@@ -473,8 +473,156 @@ const selectExpression = ({
   return `${finalExpression} AS ${quoteSqlIdentifier(destination)}`;
 };
 
-const buildQuery = (source, columns, mysqlSchema, rowDuplication, relationRows, limitRows = null) => {
+const buildDateFilterCondition = (dateFilter) => {
+  if (!dateFilter || !dateFilter.column || (!dateFilter.fromDate && !dateFilter.toDate)) {
+    return null;
+  }
+  const cleanCol = cleanSource(dateFilter.column);
+  const quotedCol = quoteSqlIdentifier(cleanCol);
+
+  if (dateFilter.fromDate && dateFilter.toDate) {
+    const fromVal = String(dateFilter.fromDate).includes(" ") || String(dateFilter.fromDate).includes("T")
+      ? String(dateFilter.fromDate).replace("T", " ")
+      : `${dateFilter.fromDate} 00:00:00`;
+    const toVal = String(dateFilter.toDate).includes(" ") || String(dateFilter.toDate).includes("T")
+      ? String(dateFilter.toDate).replace("T", " ")
+      : `${dateFilter.toDate} 23:59:59`;
+    return `${quotedCol} >= ${quoteSqlLiteral(fromVal)} AND ${quotedCol} <= ${quoteSqlLiteral(toVal)}`;
+  }
+
+  if (dateFilter.fromDate) {
+    const fromVal = String(dateFilter.fromDate).includes(" ") || String(dateFilter.fromDate).includes("T")
+      ? String(dateFilter.fromDate).replace("T", " ")
+      : `${dateFilter.fromDate} 00:00:00`;
+    return `${quotedCol} >= ${quoteSqlLiteral(fromVal)}`;
+  }
+
+  if (dateFilter.toDate) {
+    const toVal = String(dateFilter.toDate).includes(" ") || String(dateFilter.toDate).includes("T")
+      ? String(dateFilter.toDate).replace("T", " ")
+      : `${dateFilter.toDate} 23:59:59`;
+    return `${quotedCol} <= ${quoteSqlLiteral(toVal)}`;
+  }
+
+  return null;
+};
+
+const buildRelatedTableFilterCondition = (source, mysqlSchema, relatedFilter) => {
+  if (!relatedFilter || !relatedFilter.relatedTable) {
+    return null;
+  }
+  const {
+    sourceJoinColumn,
+    relatedTable,
+    relatedJoinColumn,
+    conditionColumn,
+    operator = ">",
+    conditionValue = "",
+  } = relatedFilter;
+
+  if (!sourceJoinColumn || !relatedJoinColumn || !conditionColumn) {
+    return null;
+  }
+
+  const mainTableIdent = quoteMysqlTable(mysqlSchema, source);
+  const relSchema = relatedFilter.relatedSchema || mysqlSchema;
+  const relTableIdent = quoteMysqlTable(relSchema, relatedTable);
+  const relAlias = quoteSqlIdentifier("__rel_filter__");
+
+  const cleanSourceJoin = quoteSqlIdentifier(cleanSource(sourceJoinColumn));
+  const cleanRelJoin = quoteSqlIdentifier(cleanSource(relatedJoinColumn));
+  const cleanCondCol = quoteSqlIdentifier(cleanSource(conditionColumn));
+
+  let rightSideExpr = "";
+  const opUpper = String(operator || "=").trim().toUpperCase();
+
+  if (opUpper === "IS NULL" || opUpper === "IS NOT NULL") {
+    rightSideExpr = `${relAlias}.${cleanCondCol} ${opUpper}`;
+  } else {
+    const trimmedVal = String(conditionValue !== undefined && conditionValue !== null ? conditionValue : "").trim();
+    let formattedVal;
+    if (trimmedVal === "0" || /^-?[1-9]\d*(\.\d+)?$/.test(trimmedVal) || /^-?0\.\d+$/.test(trimmedVal)) {
+      formattedVal = trimmedVal;
+    } else {
+      formattedVal = quoteSqlLiteral(trimmedVal);
+    }
+
+    let sqlOp = opUpper;
+    if (sqlOp === "!=") sqlOp = "<>";
+    rightSideExpr = `${relAlias}.${cleanCondCol} ${sqlOp} ${formattedVal}`;
+  }
+
+  return `EXISTS (SELECT 1 FROM ${relTableIdent} AS ${relAlias} WHERE ${relAlias}.${cleanRelJoin} = ${mainTableIdent}.${cleanSourceJoin} AND ${rightSideExpr})`;
+};
+
+const buildQuery = (
+  source,
+  columns,
+  mysqlSchema,
+  rowDuplication,
+  relationRows,
+  limitRows = null,
+  dateFilter = null,
+  relatedTableFilter = null
+) => {
   const limitClause = (limitRows && Number(limitRows) > 0) ? ` LIMIT ${Number(limitRows)}` : "";
+  const dateCondition = buildDateFilterCondition(dateFilter);
+  const relatedCondition = buildRelatedTableFilterCondition(source, mysqlSchema, relatedTableFilter);
+
+  const relLimit = (
+    relatedTableFilter &&
+    relatedTableFilter.limitEnabled &&
+    Number(relatedTableFilter.limitRows) > 0
+  ) ? Number(relatedTableFilter.limitRows) : null;
+
+  if (dateCondition && relatedCondition && relLimit) {
+    const tableIdent = quoteMysqlTable(mysqlSchema, source);
+    if (rowDuplication && rowDuplication.active) {
+      const getColumnsForBranch = (branch) => {
+        return columns.map((col) => {
+          if (col.isSplit) {
+            return {
+              ...col,
+              source: branch === "primary" ? rowDuplication.primarySource : rowDuplication.secondarySource,
+            };
+          }
+          if (col.destination === rowDuplication.typeColumn) {
+            return {
+              destination: col.destination,
+              constantValue: branch === "primary" ? rowDuplication.primaryValue : rowDuplication.secondaryValue,
+            };
+          }
+          return col;
+        });
+      };
+
+      const primaryCols = getColumnsForBranch("primary").map(selectExpression).join(", ");
+      const secondaryCols = getColumnsForBranch("secondary").map(selectExpression).join(", ");
+      const qPrimary = `(SELECT ${primaryCols} FROM ${tableIdent} WHERE ${dateCondition}${limitClause}) UNION (SELECT ${primaryCols} FROM ${tableIdent} WHERE ${relatedCondition} LIMIT ${relLimit})`;
+      const qSecondary = `(SELECT ${secondaryCols} FROM ${tableIdent} WHERE ${dateCondition}${limitClause}) UNION (SELECT ${secondaryCols} FROM ${tableIdent} WHERE ${relatedCondition} LIMIT ${relLimit})`;
+      return `(${qPrimary}) UNION ALL (${qSecondary});`;
+    }
+
+    const colList = columns.map(selectExpression).join(", ");
+    const dateQuery = `SELECT ${colList} FROM ${tableIdent} WHERE ${dateCondition}${limitClause}`;
+    const relatedQuery = `SELECT ${colList} FROM ${tableIdent} WHERE ${relatedCondition} LIMIT ${relLimit}`;
+    return `(${dateQuery}) UNION (${relatedQuery});`;
+  }
+
+  let effectiveLimitClause = limitClause;
+  if (!dateCondition && relatedCondition && relLimit) {
+    const effLimit = (limitRows && Number(limitRows) > 0)
+      ? Math.min(Number(limitRows), relLimit)
+      : relLimit;
+    effectiveLimitClause = ` LIMIT ${effLimit}`;
+  }
+
+  const filterConditions = [dateCondition, relatedCondition].filter(Boolean);
+  const combinedFilterCondition = filterConditions.length > 1
+    ? `(${dateCondition}) OR (${relatedCondition})`
+    : (filterConditions[0] || null);
+  const combinedWhereClause = combinedFilterCondition ? ` WHERE ${combinedFilterCondition}` : "";
+
   if (source.startsWith("no table")) {
     const maxRows = Math.max(...columns.map(col => {
       const val = col.constantValue !== undefined ? col.constantValue : col.defaultValue;
@@ -551,15 +699,24 @@ const buildQuery = (source, columns, mysqlSchema, rowDuplication, relationRows, 
 
       let statement = `SELECT ${selectList} FROM ${quoteMysqlTable(mysqlSchema, source)} CROSS JOIN (${branchNumbersTable}) AS ${branchTableAlias}`;
 
+      const conditions = [];
       if (relationRows.skipEmpty !== false) {
-        const conditions = branches.map((branch, index) => {
+        const branchConditions = branches.map((branch, index) => {
           const sourceColumn = quoteSqlIdentifier(branch.sourceColumn);
           return `(${branchRef} = ${index + 1} AND ${sourceColumn} IS NOT NULL AND TRIM(${sourceColumn}) <> '')`;
         });
-        statement += ` WHERE ${conditions.join(" OR ")}`;
+        if (branchConditions.length > 0) {
+          conditions.push(`(${branchConditions.join(" OR ")})`);
+        }
+      }
+      if (combinedFilterCondition) {
+        conditions.push(`(${combinedFilterCondition})`);
+      }
+      if (conditions.length > 0) {
+        statement += ` WHERE ${conditions.join(" AND ")}`;
       }
 
-      return `${statement}${limitClause};`;
+      return `${statement}${effectiveLimitClause};`;
     }
   }
 
@@ -585,13 +742,13 @@ const buildQuery = (source, columns, mysqlSchema, rowDuplication, relationRows, 
     const primaryColumns = getColumnsForBranch("primary");
     const secondaryColumns = getColumnsForBranch("secondary");
 
-    const queryPrimary = `SELECT ${primaryColumns.map(selectExpression).join(", ")} FROM ${quoteMysqlTable(mysqlSchema, source)}`;
-    const querySecondary = `SELECT ${secondaryColumns.map(selectExpression).join(", ")} FROM ${quoteMysqlTable(mysqlSchema, source)}`;
+    const queryPrimary = `SELECT ${primaryColumns.map(selectExpression).join(", ")} FROM ${quoteMysqlTable(mysqlSchema, source)}${combinedWhereClause}`;
+    const querySecondary = `SELECT ${secondaryColumns.map(selectExpression).join(", ")} FROM ${quoteMysqlTable(mysqlSchema, source)}${combinedWhereClause}`;
 
-    return `(${queryPrimary}) UNION ALL (${querySecondary})${limitClause};`;
+    return `(${queryPrimary}) UNION ALL (${querySecondary})${effectiveLimitClause};`;
   }
 
-  return `SELECT ${columns.map(selectExpression).join(", ")} FROM ${quoteMysqlTable(mysqlSchema, source)}${limitClause};`;
+  return `SELECT ${columns.map(selectExpression).join(", ")} FROM ${quoteMysqlTable(mysqlSchema, source)}${combinedWhereClause}${effectiveLimitClause};`;
 };
 
 export function generatePgloaderConfig({
@@ -610,10 +767,12 @@ export function generatePgloaderConfig({
       columns: selectedColumnsForTable(columnMappings, source),
       rowDuplication: columnMappings[source]?.__rowDuplication,
       relationRows: columnMappings[source]?.__relationRows,
+      dateFilter: columnMappings[source]?.__dateFilter,
+      relatedTableFilter: columnMappings[source]?.__relatedTableFilter,
     }));
 
   if (selectedTables.length === 0) {
-    return { config: "", exportScript: "", error: "Select at least one source table and destination table." };
+    return { config: "", exportScript: "", standaloneLinuxScript: "", error: "Select at least one source table and destination table." };
   }
 
   const missingColumnMappings = selectedTables.filter(({ columns }) => columns.length === 0);
@@ -621,6 +780,7 @@ export function generatePgloaderConfig({
     return {
       config: "",
       exportScript: "",
+      standaloneLinuxScript: "",
       error: `Map at least one column for: ${missingColumnMappings.map(({ source }) => source).join(", ")}.`,
     };
   }
@@ -733,6 +893,76 @@ export function generatePgloaderConfig({
     };
   }
 
+  const invalidDateFilters = [];
+  selectedTables.forEach(({ source, dateFilter }) => {
+    if (!dateFilter || !dateFilter.column) return;
+    const { column, fromDate, toDate } = dateFilter;
+    if (!fromDate && !toDate) {
+      invalidDateFilters.push(`${source}: Select From Date and To Date for date column '${column}'.`);
+      return;
+    }
+    if (fromDate && !toDate) {
+      invalidDateFilters.push(`${source}: Select To Date for date column '${column}'.`);
+      return;
+    }
+    if (!fromDate && toDate) {
+      invalidDateFilters.push(`${source}: Select From Date for date column '${column}'.`);
+      return;
+    }
+    if (fromDate && toDate && fromDate > toDate) {
+      invalidDateFilters.push(`${source}: From Date (${fromDate}) cannot be greater than To Date (${toDate}) for column '${column}'.`);
+      return;
+    }
+  });
+  if (invalidDateFilters.length > 0) {
+    return {
+      config: "",
+      exportScript: "",
+      standaloneLinuxScript: "",
+      error: invalidDateFilters.join(" "),
+    };
+  }
+
+  const invalidRelatedFilters = [];
+  selectedTables.forEach(({ source, relatedTableFilter }) => {
+    if (!relatedTableFilter || !relatedTableFilter.relatedTable) return;
+    const {
+      sourceJoinColumn,
+      relatedTable,
+      relatedJoinColumn,
+      conditionColumn,
+      operator = ">",
+      conditionValue,
+    } = relatedTableFilter;
+
+    if (!sourceJoinColumn) {
+      invalidRelatedFilters.push(`${source}: Select Main Table Join Column for related table filter on '${relatedTable}'.`);
+      return;
+    }
+    if (!relatedJoinColumn) {
+      invalidRelatedFilters.push(`${source}: Select Related Table Join Column for related table filter on '${relatedTable}'.`);
+      return;
+    }
+    if (!conditionColumn) {
+      invalidRelatedFilters.push(`${source}: Select Condition Column for related table filter on '${relatedTable}'.`);
+      return;
+    }
+    const opUpper = String(operator || "=").trim().toUpperCase();
+    const isUnary = opUpper === "IS NULL" || opUpper === "IS NOT NULL";
+    if (!isUnary && (conditionValue === "" || conditionValue === undefined || conditionValue === null)) {
+      invalidRelatedFilters.push(`${source}: Enter Condition Value for related table filter on '${relatedTable}'.`);
+      return;
+    }
+  });
+  if (invalidRelatedFilters.length > 0) {
+    return {
+      config: "",
+      exportScript: "",
+      standaloneLinuxScript: "",
+      error: invalidRelatedFilters.join(" "),
+    };
+  }
+
   const makeConfigCommands = (targetConnection) => selectedTables.map(({ source, destination, columns }) => {
     const targetColumns = columns.map(({ destination: column }) => quotePgIdentifier(column)).join(", ");
     const sourceFields = columns
@@ -775,8 +1005,8 @@ export function generatePgloaderConfig({
     : mysqlConnection.host;
   const dockerConfigCommands = makeConfigCommands(dockerPostgresConnection);
 
-  const exportCommands = selectedTables.map(({ source, columns, rowDuplication, relationRows }) => {
-    const query = buildQuery(source, columns, selectedSchemas.mysql, rowDuplication, relationRows, limitRows);
+  const exportCommands = selectedTables.map(({ source, columns, rowDuplication, relationRows, dateFilter, relatedTableFilter }) => {
+    const query = buildQuery(source, columns, selectedSchemas.mysql, rowDuplication, relationRows, limitRows, dateFilter, relatedTableFilter);
     const outputPath = `pgloader-data/${source}.tsv`;
     return [
       "mysql --batch \\",
@@ -939,8 +1169,8 @@ export function generatePgloaderConfig({
     const argumentsText = jobs.flatMap(({ arguments: values }) => values.map(quoteBash)).join(" ");
     return [`python3 lookup-transform.py ${quoteBash(`pgloader-data/${source}.tsv`)} ${argumentsText}`];
   });
-  const dockerExportCommands = selectedTables.map(({ source, columns, rowDuplication, relationRows }) => {
-    const query = buildQuery(source, columns, selectedSchemas.mysql, rowDuplication, relationRows, limitRows);
+  const dockerExportCommands = selectedTables.map(({ source, columns, rowDuplication, relationRows, dateFilter, relatedTableFilter }) => {
+    const query = buildQuery(source, columns, selectedSchemas.mysql, rowDuplication, relationRows, limitRows, dateFilter, relatedTableFilter);
     return [
       "docker exec -e MYSQL_PWD $mysqlClient mysql --batch `",
       `  --host=${dockerMysqlHost} --port=${mysqlConnection.port} \``,
@@ -977,13 +1207,60 @@ export function generatePgloaderConfig({
     return `# Performance check: index ${lookup.mysqlSchema || selectedSchemas.mysql}.${lookup.mysqlTable}.${lookup.mysqlIdColumn} and ${selectedSchemas.mysql}.${source}.${column.source}; also index PostgreSQL lookup match columns on ${lookup.postgresSchema}.${lookup.postgresTable}.`;
   });
 
+  const linuxConfig = [
+    "-- Generated by MySQL to PostgreSQL Migration Tool for Linux",
+    "-- Run mysql-to-pgloader.sh first to create the TSV files and start pgloader.",
+    "-- PostgreSQL destination tables must already exist.",
+    "",
+    configCommands.join("\n\n"),
+    "",
+  ].join("\n");
+
   return {
-    config: [
-      "-- Generated by MySQL to PostgreSQL Migration Tool for Linux",
-      "-- Run mysql-to-pgloader.sh first to create the TSV files and start pgloader.",
-      "-- PostgreSQL destination tables must already exist.",
+    config: linuxConfig,
+    standaloneLinuxScript: [
+      "#!/usr/bin/env bash",
+      "set -Eeuo pipefail",
+      "work_dir=\"$(cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")\" && pwd)\"",
+      "cd \"$work_dir\"",
       "",
-      configCommands.join("\n\n"),
+      "# Auto-create the pgloader load configuration",
+      "cat << 'EOF_PGLOADER_LOAD_CONFIG' > mysql-to-postgres.load",
+      linuxConfig.trimEnd(),
+      "EOF_PGLOADER_LOAD_CONFIG",
+      "",
+      ...(lookupJobs.length > 0 ? [
+        "# Auto-create lookup transformation script",
+        "cat << 'EOF_LOOKUP_HELPER' > lookup-transform.py",
+        LOOKUP_HELPER.trimEnd(),
+        "EOF_LOOKUP_HELPER",
+        "chmod +x lookup-transform.py",
+        "",
+      ] : []),
+      "command -v mysql >/dev/null 2>&1 || { echo 'MySQL client was not found.' >&2; exit 1; }",
+      "command -v pgloader >/dev/null 2>&1 || { echo 'pgloader was not found.' >&2; exit 1; }",
+      ...(lookupJobs.length > 0 ? ["command -v psql >/dev/null 2>&1 || { echo 'PostgreSQL client was not found.' >&2; exit 1; }", "command -v python3 >/dev/null 2>&1 || { echo 'Python 3 was not found.' >&2; exit 1; }"] : []),
+      "mkdir -p pgloader-data",
+      "rm -f lookup-duplicates.txt",
+      "migration_started=$SECONDS",
+      "export_started=$SECONDS",
+      "export_jobs=${MIGRATION_EXPORT_JOBS:-4}",
+      "[[ $export_jobs =~ ^[1-9][0-9]*$ ]] || { echo 'MIGRATION_EXPORT_JOBS must be a positive integer.' >&2; exit 1; }",
+      "export_pids=()",
+      `export MYSQL_PWD=${quoteBash(mysqlConnection.password)}`,
+      ...parallelExportCommands,
+      "for export_pid in \"${export_pids[@]}\"; do wait \"$export_pid\"; done",
+      "echo \"Export phase completed in $((SECONDS - export_started)) seconds.\"",
+      ...(lookupJobs.length > 0 ? ["lookup_started=$SECONDS", ...lookupIndexAdvice] : []),
+      ...linuxLookupCommands,
+      ...linuxLookupTransforms,
+      ...(lookupJobs.length > 0 ? ["echo \"Lookup phase completed in $((SECONDS - lookup_started)) seconds.\""] : []),
+      "unset MYSQL_PWD",
+      "",
+      "load_started=$SECONDS",
+      "pgloader mysql-to-postgres.load",
+      "echo \"Load phase completed in $((SECONDS - load_started)) seconds.\"",
+      "echo \"Migration completed in $((SECONDS - migration_started)) seconds.\"",
       "",
     ].join("\n"),
     exportScript: [
